@@ -61,11 +61,11 @@ void causeSpinnakerException() {
     );
 }
 
-class Tracker
+class CameraRecorder
 {
 public:
     // Constructor
-    Tracker(const string& mouse_ID, const string& start_time, const string& path,
+    CameraRecorder(const string& mouse_ID, const string& start_time, const string& path,
         const string& serial_number, float FPS, int windowWidth, int windowHeight)
         : mouse_ID(mouse_ID), start_time(start_time), path(path),
         camSerial(serial_number), FPS(FPS), windowWidth(windowWidth),
@@ -170,7 +170,7 @@ public:
     }
 
     // Destructor
-    ~Tracker()
+    ~CameraRecorder()
     {
         if (pCam) {
             pCam->EndAcquisition();
@@ -183,7 +183,7 @@ public:
         system->ReleaseInstance();
     }
 
-    void startTracking(bool show_frame, bool save_video)
+    void startRecording(bool show_frame, bool save_video)
     {
         frame_IDs.clear();
         timer_start_time = high_resolution_clock::now();
@@ -747,8 +747,8 @@ int main(int argc, char** argv)
     }
 
     try {
-        Tracker camera(mouse_ID, date_time, path, serial_number, FPS, windowWidth, windowHeight);
-        camera.startTracking(true, true);
+        CameraRecorder camera(mouse_ID, date_time, path, serial_number, FPS, windowWidth, windowHeight);
+        camera.startRecording(true, true);
     }
     catch (const std::exception& e) {
         cerr << "Error: " << e.what() << endl;
