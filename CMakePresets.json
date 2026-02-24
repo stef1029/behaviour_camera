@@ -1,0 +1,23 @@
+﻿{
+  "version": 6,
+  "configurePresets": [
+    {
+      "name": "windows-release",
+      "displayName": "Windows x64 Release (VS 2026)",
+      "generator": "Visual Studio 18 2026",
+      "binaryDir": "${sourceDir}/out/build/vs-release",
+      "installDir": "${sourceDir}/out/install/vs-release",
+      "cacheVariables": {
+        "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/vcpkg/scripts/buildsystems/vcpkg.cmake",
+        "VCPKG_TARGET_TRIPLET": "x64-windows",
+        "SPINNAKER_ROOT": "C:/Program Files/Teledyne/Spinnaker"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "windows-release",
+      "configurePreset": "windows-release"
+    }
+  ]
+}

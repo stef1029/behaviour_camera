@@ -1,19 +1,57 @@
+# ============================================================================
+# BUILD DIRECTORIES
+# ============================================================================
+out/                        # CMake build and install output
+build/                      # Alternative build directory
+cmake-build-*/              # CLion build directories
+
+# ============================================================================
+# CMAKE GENERATED FILES
+# ============================================================================
 CMakeLists.txt.user
 CMakeCache.txt
-CMakeFiles
-CMakeScripts
-Testing
+CMakeFiles/
+CMakeScripts/
+Testing/
 Makefile
 cmake_install.cmake
 install_manifest.txt
 compile_commands.json
 CTestTestfile.cmake
-_deps
-CMakeUserPresets.json
+_deps/
+CMakeUserPresets.json       # User-specific presets (don't commit)
 
-# CLion
-#  JetBrains specific template is maintained in a separate JetBrains.gitignore that can
-#  be found at https://github.com/github/gitignore/blob/main/Global/JetBrains.gitignore
-#  and can be added to the global gitignore or merged into this file.  For a more nuclear
-#  option (not recommended) you can uncomment the following to ignore the entire idea folder.
-#cmake-build-*
+# ============================================================================
+# VISUAL STUDIO
+# ============================================================================
+.vs/                        # Visual Studio cache/options
+*.user                      # Visual Studio user settings
+*.suo
+*.sln.docstates
+*.vcxproj.filters
+*.vcxproj.user
+
+# ============================================================================
+# COMPILED BINARIES
+# ============================================================================
+*.exe
+*.dll
+*.lib
+*.obj
+*.pdb
+*.ilk
+*.exp
+*.idb
+
+# ============================================================================
+# VCPKG (Keep vcpkg/ folder but ignore installed packages)
+# ============================================================================
+vcpkg_installed/            # Installed packages (rebuilt by CMake)
+vcpkg/downloads/            # Downloaded package archives
+vcpkg/buildtrees/           # Build artifacts
+vcpkg/packages/             # Built packages before install
+
+# Keep these vcpkg files:
+# !vcpkg/                   # Main vcpkg directory (tracked)
+# !vcpkg.json               # Dependency manifest (tracked)
+# !vcpkg-configuration.json # Configuration (tracked)
