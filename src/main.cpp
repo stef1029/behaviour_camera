@@ -125,11 +125,6 @@ public:
 
         pCam->Init();
 
-        // Print host controller information
-        cout << "===== Host Controller Information =====" << endl;
-        printHostControllerInfo();
-        cout << "=======================================" << endl;
-
         setCameraFrameRate(FPS);    // Set the frame rate
         setGPIOLine2ToOutput();     // Set GPIO Line 2 to output
         setExposureTimeLowerLimit(4000.0);  // Set exposure time lower limit
@@ -647,45 +642,6 @@ private:
             exposureTimeLowerLimit = maxExposureTimeLowerLimit;
 
         ptrExposureTimeLowerLimit->SetValue(exposureTimeLowerLimit);
-    }
-
-    void printHostControllerInfo()
-    {
-        // Access the Transport Layer node map
-        INodeMap& TLNodeMap = pCam->GetTLDeviceNodeMap();
-
-        // Get HostAdapterName
-        CStringPtr ptrHostAdapterName = TLNodeMap.GetNode("HostAdapterName");
-        if (IsReadable(ptrHostAdapterName))
-        {
-            cout << "Host Adapter Name: " << ptrHostAdapterName->GetValue() << endl;
-        }
-        else
-        {
-            cout << "Host Adapter Name: Not available" << endl;
-        }
-
-        // Get HostAdapterVendor
-        CStringPtr ptrHostAdapterVendor = TLNodeMap.GetNode("HostAdapterVendor");
-        if (IsReadable(ptrHostAdapterVendor))
-        {
-            cout << "Host Adapter Vendor: " << ptrHostAdapterVendor->GetValue() << endl;
-        }
-        else
-        {
-            cout << "Host Adapter Vendor: Not available" << endl;
-        }
-
-        // Get HostAdapterDriverVersion
-        CStringPtr ptrHostAdapterDriverVersion = TLNodeMap.GetNode("HostAdapterDriverVersion");
-        if (IsReadable(ptrHostAdapterDriverVersion))
-        {
-            cout << "Host Adapter Driver Version: " << ptrHostAdapterDriverVersion->GetValue() << endl;
-        }
-        else
-        {
-            cout << "Host Adapter Driver Version: Not available" << endl;
-        }
     }
 };
 
