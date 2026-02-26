@@ -3,8 +3,8 @@
   "configurePresets": [
     {
       "name": "windows-release",
-      "displayName": "Windows x64 Release (VS 2026)",
-      "generator": "Visual Studio 18 2026",
+      "displayName": "Windows x64 Release (VS 2022)",
+      "generator": "Visual Studio 17 2022",
       "binaryDir": "${sourceDir}/out/build/vs-release",
       "installDir": "${sourceDir}/out/install/vs-release",
       "cacheVariables": {
