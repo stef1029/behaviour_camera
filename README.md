@@ -4,27 +4,47 @@ High-speed camera capture application using Teledyne Spinnaker SDK, OpenCV, and 
 
 ## Prerequisites
 
-- **Visual Studio 2026** (or 2022)
+- **Visual Studio 2022** (or later)
 - **CMake 3.21+** (included with Visual Studio)
-- **vcpkg** (included in this repository)
+- **Git** (with submodule support)
 - **Teledyne Spinnaker SDK** - Install to `C:/Program Files/Teledyne/Spinnaker`
 
-## Building the Project
+## Getting Started
 
-### 1. Configure
+### 1. Clone the Repository
 
-Generate the build files using CMake presets:
+Clone the repo with the vcpkg submodule included:
+
+```sh
+git clone --recurse-submodules https://github.com/stef1029/behaviour_camera.git
+cd behaviour_camera
+```
+
+If you've already cloned without `--recurse-submodules`, initialise the submodule manually:
+
+```sh
+git submodule update --init
+```
+
+### 2. Bootstrap vcpkg
+
+Build the vcpkg package manager from the included submodule:
+
+```sh
+.\vcpkg\bootstrap-vcpkg.bat
+```
+
+### 3. Configure
+
+Generate the build files using CMake presets. This will also install dependencies (OpenCV, GLFW, nlohmann_json) via vcpkg automatically:
 
 ```sh
 cmake --preset windows-release
 ```
 
-This will:
-- Install dependencies via vcpkg (OpenCV, GLFW, nlohmann_json)
-- Find the Spinnaker SDK
-- Generate Visual Studio solution files in `out/build/vs-release/`
+This generates Visual Studio solution files in `out/build/vs-release/`.
 
-### 2. Build
+### 4. Build
 
 Compile the project:
 
@@ -34,9 +54,9 @@ cmake --build out/build/vs-release --config Release
 
 Or open `out/build/vs-release/behaviour_camera.sln` in Visual Studio and press F7.
 
-The executable will be created at: `out/build/vs-release/Release/behaviour_camera.exe`
+The executable will be created at `out/build/vs-release/Release/behaviour_camera.exe`.
 
-### 3. Install (Optional - For Deployment)
+### 5. Install (Optional — For Deployment)
 
 Create a standalone, portable package with all required DLLs:
 
@@ -51,6 +71,16 @@ This creates a complete deployment folder at `out/install/vs-release/bin/` conta
 - All Spinnaker SDK DLLs
 
 You can zip the `bin/` folder and deploy it to other machines.
+
+### Quick Start (All Steps)
+
+```sh
+git clone --recurse-submodules https://github.com/stef1029/behaviour_camera.git
+cd behaviour_camera
+.\vcpkg\bootstrap-vcpkg.bat
+cmake --preset windows-release
+cmake --build out/build/vs-release --config Release
+```
 
 ## Running the Application
 
@@ -85,9 +115,10 @@ behaviour_camera/
 ├── CMakeLists.txt           # Build configuration
 ├── CMakePresets.json        # CMake presets for easy configuration
 ├── vcpkg.json               # vcpkg dependency manifest
+├── .gitmodules              # vcpkg submodule reference
 ├── src/
 │   └── main.cpp             # Main application code
-├── vcpkg/                   # Local vcpkg installation
+├── vcpkg/                   # vcpkg (git submodule, pinned version)
 └── out/
     ├── build/               # Build artifacts
     └── install/             # Deployment package
