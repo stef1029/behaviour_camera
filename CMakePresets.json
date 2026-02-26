@@ -2,7 +2,7 @@
   "version": 6,
   "configurePresets": [
     {
-      "name": "windows-release",
+      "name": "windows-release-vs22",
       "displayName": "Windows x64 Release (VS 2022)",
       "generator": "Visual Studio 17 2022",
       "binaryDir": "${sourceDir}/out/build/vs-release",
@@ -12,12 +12,30 @@
         "VCPKG_TARGET_TRIPLET": "x64-windows",
         "SPINNAKER_ROOT": "C:/Program Files/Teledyne/Spinnaker"
       }
+    },
+    {
+      "name": "windows-release-vs26",
+      "displayName": "Windows x64 Release (VS 2026)",
+      "generator": "Visual Studio 18 2026",
+      "binaryDir": "${sourceDir}/out/build/vs-release",
+      "installDir": "${sourceDir}/out/install/vs-release",
+      "cacheVariables": {
+        "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/vcpkg/scripts/buildsystems/vcpkg.cmake",
+        "VCPKG_TARGET_TRIPLET": "x64-windows",
+        "SPINNAKER_ROOT": "C:/Program Files/Teledyne/Spinnaker"
+      }
     }
   ],
+
   "buildPresets": [
     {
-      "name": "windows-release",
-      "configurePreset": "windows-release",
+      "name": "windows-release-vs22",
+      "configurePreset": "windows-release-vs22",
+      "configuration": "Release"
+    },
+    {
+      "name": "windows-release-vs26",
+      "configurePreset": "windows-release-vs26",
       "configuration": "Release"
     }
   ]
