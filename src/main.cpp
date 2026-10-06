@@ -13,7 +13,8 @@
 
 // Third-party library includes
 #include <GLFW/glfw3.h>  // Must be included before any OpenGL headers
-#include <opencv2/opencv.hpp>
+#include <opencv2/core.hpp>
+#include <opencv2/imgproc.hpp>
 #include "nlohmann/json.hpp"
 
 // Spinnaker SDK includes
@@ -74,43 +75,37 @@ public:
         system = System::GetInstance();
         CameraList camList = system->GetCameras();
 
-        // Set serial number based on cam_no
-        if (camSerial == "22181614") { // rig 1
-            max_FPS = 170.0;
-            rig = "1";
+        // Which rig each camera sits on. This is only a naming table: it decides the
+        // window title and the signal-file names, nothing about how the camera is
+        // driven. An unlisted serial is therefore not an error — it records exactly
+        // the same, it just has no friendly name — so it gets one from its serial
+        // instead of being refused. Previously a new camera meant editing this list
+        // and redeploying to every rig machine before it could be used at all.
+        static const struct { const char* serial; const char* rig; } knownCameras[] = {
+            { "22181614", "1" },
+            { "20530175", "2" },
+            { "24174008", "3" },
+            { "24243513", "4" },
+            { "24174020", "openfield" },
+            { "23606054", "colour_camera" },
+            { "21423798", "6MP3_camera" },
+        };
+
+        for (const auto& known : knownCameras) {
+            if (camSerial == known.serial) {
+                rig = known.rig;
+                break;
+            }
         }
-        else if (camSerial == "20530175") {  // rig 2
-            max_FPS = 170.0;
-            rig = "2";
-        }
-        else if (camSerial == "24174008") {  // rig 3
-            max_FPS = 170.0;
-            rig = "3";
-        }
-        else if (camSerial == "24243513") { // rig 4
-            max_FPS = 170.0;
-            rig = "4";
-        }
-        else if (camSerial == "24174020") { // openfield
-            max_FPS = 170.0;
-            rig = "openfield";
-        }
-        else if (camSerial == "23606054") {  // Colour camera
-            max_FPS = 170.0;
-            rig = "colour_camera";
-        }
-        else if (camSerial == "21423798") {  // 6.3MP camera
-            max_FPS = 59.60;
-            rig = "6MP3_camera";
-        }
-        else {
-            throw runtime_error("Invalid camera number");
+        if (rig.empty()) {
+            rig = "cam_" + camSerial;
+            cout << "Camera " << camSerial << " is not in the known-rig list; "
+                 << "calling it '" << rig << "'." << endl;
         }
 
-        // Limit FPS to max amount of camera
-        if (FPS > max_FPS) {
-            FPS = max_FPS;
-        }
+        // Note: the frame rate is not clamped here. The rate a camera can sustain
+        // depends on its pixel format, ROI and exposure, so it is read from the
+        // device once it is open, in setCameraFrameRate below.
 
         windowTitle << "Rig " << rig << ". Press 'Esc' to stop session.";
         title = windowTitle.str();
@@ -125,7 +120,12 @@ public:
 
         pCam->Init();
 
-        setCameraFrameRate(FPS);    // Set the frame rate
+        // Assigning the result back to this->FPS matters. The constructor parameter
+        // is also called FPS and shadows the member, so the member keeps whatever
+        // was asked for unless it is set explicitly here — and the member is what
+        // gets written into the metadata JSON and reused by attemptRecovery(). Those
+        // used to disagree whenever a rate above the camera's maximum was requested.
+        this->FPS = static_cast<float>(setCameraFrameRate(FPS));
         setGPIOLine2ToOutput();     // Set GPIO Line 2 to output
         setExposureTimeLowerLimit(4000.0);  // Set exposure time lower limit
 
@@ -149,6 +149,7 @@ public:
         ptrAcquisitionMode->SetIntValue(acquisitionModeContinuous);
 
         pCam->BeginAcquisition();
+        acquiring = true;
 
         imageWidth = pCam->Width.GetValue();
         imageHeight = pCam->Height.GetValue();
@@ -165,17 +166,48 @@ public:
     }
 
     // Destructor
+    //
+    // Every Spinnaker call here can throw, and a destructor is implicitly noexcept:
+    // an escaping exception calls std::terminate, which showed up as the process
+    // dying with 0xC0000409 at the end of every otherwise successful session. The
+    // data was always safe — it is written and the finished-signal file created
+    // before this runs — but the exit code said the run had failed, and a launcher
+    // checking it could not tell a real failure from a normal finish.
+    //
+    // Two things fix it: only end acquisition if it is actually running (captureFrames
+    // has usually ended it already, and ending it twice is what threw), and let
+    // nothing escape.
     ~CameraRecorder()
     {
-        if (pCam) {
-            pCam->EndAcquisition();
-            pCam->DeInit();
-            pCam = nullptr;
+        try {
+            if (pCam) {
+                if (acquiring) {
+                    pCam->EndAcquisition();
+                    acquiring = false;
+                }
+                pCam->DeInit();
+            }
         }
+        catch (Spinnaker::Exception& e) {
+            cerr << "Warning: error shutting the camera down: " << e.what() << endl;
+        }
+
+        // Released whether or not the above succeeded: the system instance must
+        // outlive every camera reference, so this has to happen after pCam is gone.
+        pCam = nullptr;
+
         if (imageFile.is_open()) {
             imageFile.close();
         }
-        system->ReleaseInstance();
+
+        try {
+            if (system) {
+                system->ReleaseInstance();
+            }
+        }
+        catch (Spinnaker::Exception& e) {
+            cerr << "Warning: error releasing the Spinnaker system: " << e.what() << endl;
+        }
     }
 
     void startRecording(bool show_frame, bool save_video)
@@ -203,7 +235,9 @@ private:
     string rig;
     float FPS;
     size_t frame_count;
-    float max_FPS;
+    // Whether BeginAcquisition is currently in effect. Ending acquisition twice
+    // throws, and the second call used to come from the destructor.
+    bool acquiring = false;
     CameraPtr pCam;
     SystemPtr system;
     vector<uint64_t> frame_IDs;
@@ -378,8 +412,9 @@ private:
             }
         }
 
-        if (pCam) {
+        if (pCam && acquiring) {
             pCam->EndAcquisition();
+            acquiring = false;
         }
 
         // After the loop, flush any remaining frame IDs in the buffer
@@ -409,7 +444,10 @@ private:
         try {
             cerr << "Attempting camera recovery (attempt " << recoveryAttempts + 1 << " of " << MAX_RECOVERY_ATTEMPTS << ")..." << endl;
 
-            pCam->EndAcquisition();
+            if (acquiring) {
+                pCam->EndAcquisition();
+                acquiring = false;
+            }
             std::this_thread::sleep_for(std::chrono::milliseconds(500));
 
             // Reset camera settings
@@ -422,6 +460,7 @@ private:
             setExposureTimeLowerLimit(4000.0);
 
             pCam->BeginAcquisition();
+            acquiring = true;
 
             // Test if camera is working
             ImagePtr testImage = pCam->GetNextImage(1000);
@@ -543,7 +582,12 @@ private:
         return string(buffer);
     }
 
-    void setCameraFrameRate(double frameRate)
+    // Sets the acquisition frame rate, clamped to what this camera currently
+    // permits, and returns the rate actually applied so the caller can record the
+    // truth rather than the request. The permitted range depends on pixel format,
+    // ROI and exposure time, which is why it is read from the device here instead
+    // of being kept in a table that has to be maintained by hand.
+    double setCameraFrameRate(double frameRate)
     {
         INodeMap& nodeMap = pCam->GetNodeMap();
         CBooleanPtr ptrFrameRateEnable = nodeMap.GetNode("AcquisitionFrameRateEnable");
@@ -555,12 +599,33 @@ private:
         }
 
         CFloatPtr ptrFrameRate = nodeMap.GetNode("AcquisitionFrameRate");
-        if (IsWritable(ptrFrameRate)) {
-            ptrFrameRate->SetValue(frameRate);
-        }
-        else {
+        if (!IsWritable(ptrFrameRate)) {
             throw runtime_error("Unable to set frame rate");
         }
+
+        const double minRate = ptrFrameRate->GetMin();
+        const double maxRate = ptrFrameRate->GetMax();
+        double applied = frameRate;
+        if (applied < minRate) {
+            applied = minRate;
+        }
+        else if (applied > maxRate) {
+            applied = maxRate;
+        }
+
+        if (applied != frameRate) {
+            cout << "Requested " << frameRate << " fps; this camera allows "
+                 << minRate << " to " << maxRate << " fps, so recording at "
+                 << applied << " fps." << endl;
+        }
+
+        ptrFrameRate->SetValue(applied);
+
+        // Read it back rather than returning what we asked for. The camera
+        // quantises the rate to what its timing can actually produce, so a request
+        // for 60 may become 59.99, and the metadata should record the rate the
+        // frames were really captured at.
+        return ptrFrameRate->GetValue();
     }
 
     void setGPIOLine2ToOutput()
@@ -696,10 +761,23 @@ int main(int argc, char** argv)
         // Default path if none is provided
         path = "E:\\test_vid_output";  // Change this to your desired default path
         path += "\\" + date_time + "_" + mouse_ID;
-        if (_mkdir(path.c_str()) != 0) {
-            cerr << "Error: Unable to create directory " << path << endl;
-            return -1;
-        }
+    }
+
+    // Create the output directory whichever way the path was arrived at. A path
+    // given with --path used to be left alone, so the only sign that it did not
+    // exist was the binary file failing to open several steps later; and the old
+    // _mkdir call could not create a missing parent, nor tolerate the directory
+    // already being there.
+    try {
+        fs::create_directories(path);
+    }
+    catch (const fs::filesystem_error& e) {
+        cerr << "Error: unable to create output directory " << path << ": " << e.what() << endl;
+        return -1;
+    }
+    if (!fs::is_directory(path)) {
+        cerr << "Error: output path is not a directory: " << path << endl;
+        return -1;
     }
 
     try {

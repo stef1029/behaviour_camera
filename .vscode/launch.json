@@ -1,0 +1,44 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      // Probe only: enumerates cameras and grabs a short burst. Safe to run any
+      // time, writes nothing to disk.
+      "name": "Probe camera (grab 300 frames)",
+      "type": "cppvsdbg",
+      "request": "launch",
+      "program": "${workspaceFolder}/out/build/${command:cmake.activeConfigurePresetName}/camera_probe.exe",
+      "args": ["--serial", "26043809", "--frames", "300", "--fps", "60"],
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "preLaunchTask": "CMake: build"
+    },
+    {
+      // Records into out/test_recordings, not the real data drive, so debugging
+      // never lands files among experimental sessions.
+      "name": "Record a test session",
+      "type": "cppvsdbg",
+      "request": "launch",
+      "program": "${workspaceFolder}/out/build/${command:cmake.activeConfigurePresetName}/behaviour_camera.exe",
+      "args": [
+        "--serial_number", "26043809",
+        "--id", "debug",
+        "--fps", "60",
+        "--path", "${workspaceFolder}/out/test_recordings/debug_session"
+      ],
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "preLaunchTask": "CMake: build test recording dir"
+    },
+    {
+      // Whatever target is selected in the CMake Tools status bar, no arguments.
+      "name": "Launch selected CMake target",
+      "type": "cppvsdbg",
+      "request": "launch",
+      "program": "${command:cmake.launchTargetPath}",
+      "args": [],
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal"
+    }
+  ]
+}

@@ -1,0 +1,44 @@
+{
+  // CMake Tools drives the build from CMakePresets.json, so the presets stay the
+  // single source of truth and the command line and the IDE cannot disagree.
+  "cmake.useCMakePresets": "always",
+  "cmake.configureOnOpen": true,
+  "cmake.defaultConfigurePreset": "ninja-release",
+  "cmake.defaultBuildPreset": "ninja-release",
+
+  // Build before launching, so F5 never silently runs a stale binary.
+  "cmake.buildBeforeRun": true,
+
+  // Let CMake Tools feed IntelliSense the real compiler flags and include paths
+  // instead of maintaining a parallel c_cpp_properties.json by hand.
+  "C_Cpp.default.configurationProvider": "ms-vscode.cmake-tools",
+  "C_Cpp.default.cppStandard": "c++20",
+
+  "files.associations": {
+    "*.cmd": "bat"
+  },
+
+  // Build output and the vendored vcpkg tree are large and never edited here;
+  // hiding them keeps search and the file tree usable.
+  "files.exclude": {
+    "out/": true,
+    "vcpkg_installed/": true,
+    ".vs/": true
+  },
+  "search.exclude": {
+    "out/": true,
+    "vcpkg/": true,
+    "vcpkg_installed/": true
+  },
+  "files.watcherExclude": {
+    "**/out/**": true,
+    "**/vcpkg/**": true,
+    "**/vcpkg_installed/**": true
+  },
+
+  "[cpp]": {
+    "editor.tabSize": 4,
+    "editor.insertSpaces": true,
+    "editor.rulers": [100]
+  }
+}

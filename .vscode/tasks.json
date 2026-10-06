@@ -1,0 +1,51 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "CMake: build",
+      "type": "cmake",
+      "command": "build",
+      "group": { "kind": "build", "isDefault": true },
+      "problemMatcher": ["$msCompile"],
+      "detail": "Build the active preset (Ctrl+Shift+B)"
+    },
+    {
+      "label": "CMake: configure",
+      "type": "cmake",
+      "command": "configure",
+      "problemMatcher": [],
+      "detail": "Re-run CMake configure for the active preset"
+    },
+    {
+      // The recorder does not create its output directory when --path is given,
+      // so make it here rather than having the debug launch fail on a missing dir.
+      "label": "CMake: build test recording dir",
+      "dependsOrder": "sequence",
+      "dependsOn": ["CMake: build"],
+      "type": "shell",
+      "command": "New-Item -ItemType Directory -Force -Path '${workspaceFolder}/out/test_recordings/debug_session' | Out-Null",
+      "options": { "shell": { "executable": "powershell.exe", "args": ["-NoProfile", "-Command"] } },
+      "problemMatcher": []
+    },
+    {
+      "label": "Probe camera",
+      "type": "shell",
+      "command": "${workspaceFolder}/test_camera.cmd",
+      "args": ["probe"],
+      "dependsOn": ["CMake: build"],
+      "problemMatcher": [],
+      "presentation": { "reveal": "always", "panel": "dedicated" },
+      "detail": "List cameras and measure the capture rate (writes nothing)"
+    },
+    {
+      "label": "Test camera: full recording",
+      "type": "shell",
+      "command": "${workspaceFolder}/test_camera.cmd",
+      "args": ["record"],
+      "dependsOn": ["CMake: build"],
+      "problemMatcher": [],
+      "presentation": { "reveal": "always", "panel": "dedicated" },
+      "detail": "Probe, record a short test session, then verify the output"
+    }
+  ]
+}
