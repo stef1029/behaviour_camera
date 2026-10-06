@@ -15,11 +15,11 @@
 #include <GLFW/glfw3.h>  // Must be included before any OpenGL headers
 #include <opencv2/core.hpp>
 #include <opencv2/imgproc.hpp>
-#include "nlohmann/json.hpp"
+#include <nlohmann/json.hpp>
 
 // Spinnaker SDK includes
-#include "Spinnaker.h"
-#include "SpinGenApi/SpinnakerGenApi.h"
+#include <Spinnaker.h>
+#include <SpinGenApi/SpinnakerGenApi.h>
 
 using namespace Spinnaker;
 using namespace Spinnaker::GenApi;

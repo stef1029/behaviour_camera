@@ -7,6 +7,20 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # Export a compile database so clangd / IntelliSense work without guessing flags.
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+# Pass dependency include directories as plain /I rather than MSVC's /external:I.
+#
+# CMake treats imported targets' include directories as SYSTEM, which on MSVC
+# becomes /external:I. The compiler understands that, but VS Code's IntelliSense
+# does not read it as an include path — so every #include of a Spinnaker, OpenCV
+# or GLFW header was underlined as "cannot open source file" in the editor while
+# compiling perfectly well. Editor and compiler now see the same include paths.
+#
+# Vendor headers still do not produce warnings: /external:anglebrackets below
+# classifies anything included with <angle brackets> as external, which covers the
+# dependencies and the standard library without depending on how the include path
+# was spelled on the command line.
+set(CMAKE_NO_SYSTEM_FROM_IMPORTED TRUE)
+
 # ============================================================================
 # DEPENDENCIES (vcpkg-managed)
 # ============================================================================
@@ -82,7 +96,14 @@ target_compile_options(project_options INTERFACE
     # are not guaranteed to run while an exception propagates — which this program
     # depends on, since every camera fault arrives as a thrown Spinnaker::Exception
     # and the handlers above it expect frames and files to be released on the way out.
-    $<$<CXX_COMPILER_ID:MSVC>:/EHsc;/W4;/permissive-;/MP;/utf-8>
+    #
+    # /external:anglebrackets + /external:W0 silence warnings from any header
+    # included with <angle brackets> — the dependencies and the standard library —
+    # so /W4 reports only this project's own code. This replaces the SYSTEM include
+    # treatment turned off above, and is independent of how include paths are
+    # spelled, so IntelliSense can still read them. Project headers must therefore
+    # be included with "quotes" to stay covered by /W4.
+    $<$<CXX_COMPILER_ID:MSVC>:/EHsc;/W4;/permissive-;/MP;/utf-8;/external:anglebrackets;/external:W0>
 )
 # Deliberately NOT /Zc:__cplusplus, tempting though it is. SpinnakerPlatform.h
 # switches on `__cplusplus >= 201402L`, and that branch defines its deprecation
