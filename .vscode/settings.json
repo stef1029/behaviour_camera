@@ -15,7 +15,11 @@
   "C_Cpp.default.cppStandard": "c++20",
 
   "files.associations": {
-    "*.cmd": "bat"
+    "*.cmd": "bat",
+    // CMake presets and the camera config are JSON with comments. Without this
+    // VS Code validates them as strict JSON and flags every comment as an error.
+    "CMakePresets.json": "jsonc",
+    "behaviour_camera.json": "jsonc"
   },
 
   // Build output and the vendored vcpkg tree are large and never edited here;

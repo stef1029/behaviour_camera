@@ -833,31 +833,54 @@ void printUsage()
     cout <<
         "behaviour_camera - records from a Teledyne/FLIR camera\n"
         "\n"
+        "Every setting has a working default, so only --serial_number is required.\n"
+        "The options below override those defaults for one run; the rig launcher\n"
+        "fills them in from each rig's camera section in rigs.yaml.\n"
+        "\n"
+        "Session\n"
         "  --serial_number <id>   camera to record from (required)\n"
         "  --id <name>            subject ID, used in filenames (default NoID)\n"
         "  --date <stamp>         date stamp for filenames (default: now)\n"
         "  --path <dir>           output directory, created if missing\n"
+        "  --rig <name>           rig name used in the signal filenames\n"
+        "\n"
+        "Camera\n"
         "  --fps <rate>           frame rate; clamped to what the camera allows\n"
+        "  --exposure-min <us>    auto-exposure floor in microseconds\n"
+        "  --stream-buffers <n>   frames the driver may hold while writing\n"
+        "  --strobe-line <n>      GPIO line pulsed once per frame\n"
+        "\n"
+        "Recording\n"
+        "  --mode raw|video       .bin of raw frames, or GPU-encoded video\n"
+        "  --qp <n>               encoder quality, lower is better (video mode)\n"
+        "  --gop <n>              frames between keyframes (video mode)\n"
+        "\n"
+        "Preview\n"
         "  --windowWidth <px>     preview width\n"
         "  --windowHeight <px>    preview height\n"
-        "  --config <file>        settings file (default: search for one)\n"
         "  --no-preview           record without a preview window\n"
+        "\n"
         "  --help                 this message\n"
         "\n"
-        "Settings not given here come from the config file; run camera_probe to see\n"
-        "which cameras are attached.\n";
+        "Run camera_probe to see which cameras are attached.\n";
 }
 
+// Only what was actually asked for. Anything left unset keeps the default from
+// Settings, so an option that is not passed cannot change behaviour.
 struct Arguments
 {
     string mouse_ID = "NoID";
     string date_time;
     string path;
     string serial_number;
-    string configPath;
     string mode;
     string rig;
     optional<double> fps;
+    optional<double> exposureMin;
+    optional<int> streamBuffers;
+    optional<int> strobeLine;
+    optional<int> qp;
+    optional<int> gop;
     optional<int> windowWidth;
     optional<int> windowHeight;
     bool showPreview = true;
@@ -894,10 +917,14 @@ bool parseArguments(int argc, char** argv, Arguments& args, int& exitCode)
             else if (arg == "--date") args.date_time = value;
             else if (arg == "--path") args.path = value;
             else if (arg == "--serial_number") args.serial_number = value;
-            else if (arg == "--config") args.configPath = value;
             else if (arg == "--mode") args.mode = value;
             else if (arg == "--rig") args.rig = value;
             else if (arg == "--fps") args.fps = stod(value);
+            else if (arg == "--exposure-min") args.exposureMin = stod(value);
+            else if (arg == "--stream-buffers") args.streamBuffers = stoi(value);
+            else if (arg == "--strobe-line") args.strobeLine = stoi(value);
+            else if (arg == "--qp") args.qp = stoi(value);
+            else if (arg == "--gop") args.gop = stoi(value);
             else if (arg == "--windowWidth") args.windowWidth = stoi(value);
             else if (arg == "--windowHeight") args.windowHeight = stoi(value);
             else {
@@ -940,33 +967,27 @@ int main(int argc, char** argv)
         args.date_time = currentDateTime();
     }
 
+    // Defaults from the code, then whatever this run asked for. Nothing is read
+    // from disk, so there is no second place for camera settings to live and
+    // disagree with the rig configuration.
     Settings settings;
-    try {
-        const behaviour_camera::ConfigFile config = behaviour_camera::findConfig(args.configPath);
-        settings = behaviour_camera::resolveSettings(config, args.serial_number);
-        if (config.found()) {
-            cout << "Settings from " << config.path << endl;
-        } else {
-            cout << "No config file found; using built-in defaults." << endl;
-        }
-    }
-    catch (const std::exception& e) {
-        cerr << "Error: " << e.what() << endl;
-        return 2;
-    }
 
-    // The command line is the last layer, overriding the file.
-    // Overriding the rig name matters more than it looks. The launcher watches for
-    // rig_<name>_camera_finished.signal and writes stop_camera_<name>.signal, and it
-    // derives <name> from its own configuration. Letting it say so outright removes
-    // the need for two separate config files to agree, which they previously did
-    // only by coincidence - and a silent disagreement leaves the launcher waiting
-    // for a signal that is never written.
-    if (!args.rig.empty()) settings.rig = args.rig;
-    if (!args.mode.empty()) settings.recording_mode = args.mode;
-    if (args.fps) settings.fps = *args.fps;
-    if (args.windowWidth) settings.window_width = *args.windowWidth;
-    if (args.windowHeight) settings.window_height = *args.windowHeight;
+    // The rig name matters more than it looks: the launcher watches for
+    // rig_<name>_camera_finished.signal and writes stop_camera_<name>.signal, and
+    // it knows the name from its own configuration. Taking it from the launcher
+    // means the two cannot disagree. Falling back to the serial keeps a bench
+    // camera working with no arguments at all.
+    settings.rig = args.rig.empty() ? ("cam_" + args.serial_number) : args.rig;
+
+    if (!args.mode.empty())   settings.recording_mode = args.mode;
+    if (args.fps)             settings.fps = *args.fps;
+    if (args.exposureMin)     settings.exposure_lower_limit_us = *args.exposureMin;
+    if (args.streamBuffers)   settings.stream_buffers = *args.streamBuffers;
+    if (args.strobeLine)      settings.strobe_line = *args.strobeLine;
+    if (args.qp)              settings.video.qp = *args.qp;
+    if (args.gop)             settings.video.gop = *args.gop;
+    if (args.windowWidth)     settings.window_width = *args.windowWidth;
+    if (args.windowHeight)    settings.window_height = *args.windowHeight;
 
     string path = args.path;
     if (path.empty()) {

@@ -92,8 +92,12 @@ out\build\ninja-release\behaviour_camera.exe --serial_number 26043809 --fps 60
 | `--path` | Output directory, created if missing | `E:\test_vid_output\{date}_{id}` |
 | `--fps` | Frame rate; clamped to what the camera allows | `60` |
 | `--windowWidth`, `--windowHeight` | Preview window size | `800` x `600` |
-| `--mode` | `raw` or `video` | from config |
-| `--config` | Settings file | searched for |
+| `--mode` | `raw` or `video` | `raw` |
+| `--rig` | Rig name used in the signal filenames | from the serial |
+| `--exposure-min` | Auto-exposure floor, microseconds | `4000` |
+| `--stream-buffers` | Frames the driver may hold while writing | `300` |
+| `--strobe-line` | GPIO line pulsed once per frame | `2` |
+| `--qp`, `--gop` | Encoder quality and keyframe interval | `23`, `30` |
 | `--no-preview` | Record without a preview window | preview on |
 
 Stops on **Esc** in the preview window, or when a file named
@@ -158,16 +162,25 @@ Exit codes: 0 consistent, 1 frames dropped but files sound, 2 inconsistent.
 
 ## Configuration
 
-Rig names and camera settings live in [config/behaviour_camera.json](config/behaviour_camera.json),
-not in the code. Settings resolve in layers — built-in defaults, the file's
-`defaults` block, the per-camera block, then the command line — and each layer only
-overrides what it names. A camera that is not listed still records; it is just called
-`cam_<serial>`.
+Every setting has a working default in the code, so the recorder needs no config
+file and runs with only `--serial_number`. Anything a rig differs on is passed on
+the command line, and the rig launcher fills those in from each rig's `camera:`
+section in `rigs.yaml` — which makes that file the single place rig hardware is
+described.
 
-The file is looked for next to the executable, in a `config/` folder beside or above
-it, in the working directory, at `BEHAVIOUR_CAMERA_CONFIG`, or wherever `--config`
-points. Whatever was resolved is written into each session's metadata, so a recording
-carries the settings it actually ran with.
+```yaml
+rigs:
+  - name: "Rig 3"
+    camera:
+      serial: "24174008"
+      fps: 30
+      mode: video              # "raw" | "video"
+      exposure_min_us: 4000    # per-rig illumination
+      window: { width: 640, height: 512 }
+```
+
+List only what the rig differs on; omitted values keep the built-in default. Run
+`behaviour_camera --help` for the full set of overrides.
 
 ## Rig machine setup
 

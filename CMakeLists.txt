@@ -163,7 +163,6 @@ copy_runtime_dlls(camera_probe)
 # INSTALLATION
 # ============================================================================
 install(TARGETS behaviour_camera camera_probe RUNTIME DESTINATION bin)
-install(FILES config/behaviour_camera.json DESTINATION bin/config)
 
 # vcpkg's own DLLs (OpenCV, GLFW and whatever they pull in).
 #
