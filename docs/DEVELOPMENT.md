@@ -55,8 +55,10 @@ contains only the GPU extras, which this project does not use.
 
 ### Git (required)
 
-Any recent version. The clone is around 60 MB because vcpkg is vendored into the
-repository rather than used as a submodule, so there is nothing extra to initialise.
+Any recent version. vcpkg comes in as a **git submodule**, so the clone needs
+`--recurse-submodules` (see [Clone](#2-clone)). Forget it and the `vcpkg` directory
+is empty, CMake cannot find its toolchain file, and configuring fails before it
+reaches the compiler.
 
 ### VS Code (recommended)
 
@@ -76,9 +78,23 @@ packages are needed. Skip it and the test script simply skips that final check.
 
 ## 2. Clone
 
+vcpkg is a submodule, so clone it with the repository:
+
 ```sh
-git clone <repository-url> C:\dev\projects\behaviour_camera
+git clone --recurse-submodules https://github.com/stef1029/behaviour_camera.git C:\dev\projects\behaviour_camera
 cd C:\dev\projects\behaviour_camera
+```
+
+Already cloned without it? Pull the submodule down separately:
+
+```sh
+git submodule update --init
+```
+
+Check it worked before going further — this file must exist:
+
+```sh
+dir vcpkg\scripts\buildsystems\vcpkg.cmake
 ```
 
 Avoid paths with spaces or non-ASCII characters. Some vcpkg port build scripts
@@ -218,7 +234,12 @@ Visual Studio all read it, so they cannot drift apart. Three presets:
 |---|---|
 | `ninja-release` | day-to-day work. RelWithDebInfo: optimised, with debug symbols |
 | `ninja-debug` | debugging. Debug CRT, links the debug Spinnaker library |
-| `vs2026` | generates a `.sln` for Visual Studio's debugger and profiler |
+| `vs2022` | generates a `.sln` on machines with Visual Studio 2022 |
+| `vs2026` | generates a `.sln` on machines with Visual Studio 2026 |
+
+Each preset builds into `out/build/<preset-name>/`, so switching between them never
+provokes the "generator does not match" error that comes of two generators sharing
+one build directory.
 
 Keeping both Ninja and Visual Studio is deliberate. Ninja builds incrementally much
 faster, but Visual Studio still has the better debugger and the only profiler —
@@ -271,6 +292,32 @@ In PowerShell, wrap the pair in a single `cmd` invocation instead:
 ```powershell
 cmd /c "scripts\dev_env.cmd && cmake --preset ninja-release"
 ```
+
+### `Could not find toolchain file: .../vcpkg/scripts/buildsystems/vcpkg.cmake`
+
+The vcpkg submodule was never checked out. Run:
+
+```sh
+git submodule update --init
+```
+
+If that fails with *"destination path 'vcpkg' already exists and is not an empty
+directory"*, the folder still holds leftovers from a previous non-submodule checkout
+— vcpkg's `buildtrees`, `downloads`, `packages` and `vcpkg.exe` are all gitignored,
+so they survive the switch and block the clone. Move the folder aside, let the
+submodule clone into the empty path, then move `downloads` back to avoid
+re-fetching source tarballs:
+
+```powershell
+Move-Item vcpkg out\vcpkg_scratch_backup
+git submodule update --init
+Move-Item out\vcpkg_scratch_backup\downloads vcpkg\downloads
+```
+
+`out\vcpkg_scratch_backup` can then be deleted. `buildtrees` and `packages` are
+scratch space and can run to several GB; `vcpkg_installed/` at the repository root is
+the tree the build actually consumes and is untouched by any of this, so clearing
+them does not trigger a dependency rebuild.
 
 ### Spinnaker SDK not found
 

@@ -3,7 +3,8 @@ REM Build the project. Double-click, or run from a terminal.
 REM
 REM   build.cmd              build Release (RelWithDebInfo: optimised, with symbols)
 REM   build.cmd debug        build Debug
-REM   build.cmd vs           generate a Visual Studio solution instead
+REM   build.cmd vs           generate a Visual Studio 2026 solution instead
+REM   build.cmd vs2022       generate a Visual Studio 2022 solution instead
 REM   build.cmd clean        delete the build tree and build Release from scratch
 
 setlocal
@@ -12,8 +13,10 @@ cd /d "%~dp0"
 call "%~dp0scripts\dev_env.cmd" || goto :failed
 
 set "PRESET=ninja-release"
-if /i "%~1"=="debug" set "PRESET=ninja-debug"
-if /i "%~1"=="vs"    set "PRESET=vs2026"
+if /i "%~1"=="debug"  set "PRESET=ninja-debug"
+if /i "%~1"=="vs"     set "PRESET=vs2026"
+if /i "%~1"=="vs2026" set "PRESET=vs2026"
+if /i "%~1"=="vs2022" set "PRESET=vs2022"
 
 if /i "%~1"=="clean" (
     echo Removing out\build\ninja-release ...
@@ -26,10 +29,11 @@ cmake --preset %PRESET% || goto :failed
 
 echo.
 echo === Building (%PRESET%) ===
-if /i "%PRESET%"=="vs2026" (
-    cmake --build --preset vs2026-release || goto :failed
+echo %PRESET% | findstr /b /c:"vs" >nul
+if not errorlevel 1 (
+    cmake --build --preset %PRESET%-release || goto :failed
     echo.
-    echo Solution: out\build\vs2026\behaviour_camera.sln
+    echo Solution: out\build\%PRESET%\behaviour_camera.sln
 ) else (
     cmake --build --preset %PRESET% || goto :failed
     echo.

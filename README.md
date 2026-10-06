@@ -19,7 +19,8 @@ From a terminal they take arguments:
 ```sh
 build.cmd                 # Release (RelWithDebInfo: optimised, with symbols)
 build.cmd debug           # Debug
-build.cmd vs              # generate a Visual Studio solution instead
+build.cmd vs              # generate a Visual Studio 2026 solution instead
+build.cmd vs2022          # ... or a Visual Studio 2022 one
 build.cmd clean           # wipe the build tree and rebuild
 
 test_camera.cmd list      # which cameras can I see?
@@ -43,8 +44,23 @@ computer. The short version:
   ship with its CMake component, so nothing needs to be on your PATH.
 - **Teledyne Spinnaker SDK**, installed to `C:/Program Files/Teledyne/Spinnaker`.
   Point `SPINNAKER_ROOT` elsewhere if yours is not there.
-- **vcpkg**, vendored in this repository. Dependencies install on first configure.
+- **vcpkg**, included as a git submodule. Dependencies install on first configure.
 - **Python 3** is optional, used only by the recording verifier.
+
+From nothing to a built binary:
+
+```sh
+git clone --recurse-submodules https://github.com/stef1029/behaviour_camera.git
+cd behaviour_camera
+build.cmd
+```
+
+If you cloned without `--recurse-submodules`, the `vcpkg` directory will be empty and
+CMake will not find its toolchain file. Fix it with:
+
+```sh
+git submodule update --init
+```
 
 ## Working in VS Code
 
@@ -53,8 +69,8 @@ Install the recommended extensions when prompted (CMake Tools and C/C++), then:
 - **Ctrl+Shift+B** builds.
 - **F5** debugs. Three launch configurations are set up: probe the camera, record a
   test session, or run whichever target is selected in the status bar.
-- The CMake Tools status bar switches between the `ninja-release`, `ninja-debug` and
-  `vs2026` presets.
+- The CMake Tools status bar switches between the `ninja-release`, `ninja-debug`,
+  `vs2022` and `vs2026` presets.
 
 `CMakePresets.json` is the single source of truth, so the command line, VS Code and
 Visual Studio all build identically. Visual Studio remains worth keeping for its
