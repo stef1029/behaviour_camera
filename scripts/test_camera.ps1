@@ -91,18 +91,26 @@ New-Item -ItemType Directory -Force -Path $sessionDir | Out-Null
 
 Write-Heading "Recording $Seconds s to $sessionDir"
 
-# The recorder stops on Esc, or when it finds a stop-signal file named after the
-# rig. The rig name comes from the table in main.cpp, falling back to cam_<serial>
-# for a camera that is not listed there. This mirrors that rule so the test can
-# stop the recording cleanly rather than killing it, which would skip the metadata
-# write and make the verification below meaningless. Both copies disappear once the
-# rig names live in a config file.
-$knownRigs = @{
-    '22181614' = '1'; '20530175' = '2'; '24174008' = '3'; '24243513' = '4'
-    '24174020' = 'openfield'; '23606054' = 'colour_camera'; '21423798' = '6MP3_camera'
+# The recorder stops on Esc, or when it finds a stop-signal file named after the rig.
+# The rig name comes from the config file, so rather than duplicating that lookup
+# here, it is read back from the metadata the recorder writes as soon as it starts.
+# Stopping it this way rather than killing it is what makes the verification below
+# meaningful: a killed recorder never writes its metadata.
+function Get-RigName($dir, $timeoutSeconds = 15) {
+    $deadline = (Get-Date).AddSeconds($timeoutSeconds)
+    while ((Get-Date) -lt $deadline) {
+        foreach ($meta in Get-ChildItem -Path $dir -Filter '*_Tracker_data.json' -ErrorAction SilentlyContinue) {
+            try {
+                $rig = (Get-Content $meta.FullName -Raw | ConvertFrom-Json).rig
+                if ($rig) { return $rig }
+            } catch {
+                # Still being written; try again shortly.
+            }
+        }
+        Start-Sleep -Milliseconds 200
+    }
+    return $null
 }
-$rig = if ($knownRigs.ContainsKey($Serial)) { $knownRigs[$Serial] } else { "cam_$Serial" }
-$stopSignal = Join-Path $sessionDir "stop_camera_$rig.signal"
 
 $proc = Start-Process -FilePath $recordExe -PassThru -NoNewWindow -ArgumentList @(
     '--serial_number', $Serial
@@ -130,8 +138,14 @@ if ($proc.HasExited) {
 Start-Sleep -Seconds $Seconds
 
 if (-not $proc.HasExited) {
-    Write-Host 'Writing the stop signal...'
-    New-Item -ItemType File -Path $stopSignal -Force | Out-Null
+    $rig = Get-RigName $sessionDir
+    if (-not $rig) {
+        Write-Host 'Could not read the rig name from the metadata; press Esc in the window.' -ForegroundColor Yellow
+        $proc.WaitForExit()
+    } else {
+        Write-Host "Writing the stop signal for rig '$rig'..."
+        New-Item -ItemType File -Path (Join-Path $sessionDir "stop_camera_$rig.signal") -Force | Out-Null
+    }
     if (-not $proc.WaitForExit(30000)) {
         Write-Host 'Recorder did not stop within 30 s; terminating.' -ForegroundColor Yellow
         Write-Host 'Note: the files it wrote may be incomplete.' -ForegroundColor Yellow

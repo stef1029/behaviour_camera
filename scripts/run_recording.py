@@ -9,6 +9,7 @@ Nothing here needs a virtualenv - standard library only.
 
 from __future__ import annotations
 
+import json
 import subprocess
 import sys
 import time
@@ -42,18 +43,25 @@ REPO = Path(__file__).resolve().parent.parent
 INSTALL_EXE = REPO / "out" / "install" / "ninja-release" / "bin" / "behaviour_camera.exe"
 BUILD_EXE = REPO / "out" / "build" / "ninja-release" / "behaviour_camera.exe"
 
-# Mirrors the table in src/main.cpp. Only needed to work out the stop-signal
-# filename when DURATION_SECONDS is set; a camera that is not listed there is
-# called cam_<serial>. Both copies go away once rig names live in a config file.
-KNOWN_RIGS = {
-    "22181614": "1",
-    "20530175": "2",
-    "24174008": "3",
-    "24243513": "4",
-    "24174020": "openfield",
-    "23606054": "colour_camera",
-    "21423798": "6MP3_camera",
-}
+def rig_name(session_dir: Path, timeout: float = 15.0) -> str | None:
+    """The rig name this session is recording under, or None if it never appeared.
+
+    Read from the metadata the recorder writes as soon as it starts, rather than
+    worked out here. The rig name comes from the config file, so duplicating that
+    lookup would mean two places to keep in step, and the stop-signal filename
+    depends on getting it right.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        for meta in session_dir.glob("*_Tracker_data.json"):
+            try:
+                rig = json.loads(meta.read_text()).get("rig")
+            except (OSError, json.JSONDecodeError):
+                continue    # still being written; try again shortly
+            if rig:
+                return rig
+        time.sleep(0.2)
+    return None
 
 
 def find_executable() -> Path:
@@ -122,9 +130,6 @@ def main() -> int:
         process = subprocess.run(command)
         exit_code = process.returncode
     else:
-        rig = KNOWN_RIGS.get(SERIAL_NUMBER, f"cam_{SERIAL_NUMBER}")
-        stop_signal = session_dir / f"stop_camera_{rig}.signal"
-
         print(f"Stopping automatically after {DURATION_SECONDS:g} s "
               f"(or press Esc in the preview window).")
         print()
@@ -140,7 +145,12 @@ def main() -> int:
         try:
             process.wait(timeout=max(0.0, DURATION_SECONDS - 2))
         except subprocess.TimeoutExpired:
-            stop_signal.touch()
+            rig = rig_name(session_dir)
+            if rig is None:
+                print("Could not work out the rig name; press Esc in the preview window.")
+                process.wait()
+            else:
+                (session_dir / f"stop_camera_{rig}.signal").touch()
             try:
                 process.wait(timeout=30)
             except subprocess.TimeoutExpired:

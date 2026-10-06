@@ -1,0 +1,56 @@
+// Camera and rig settings for behaviour_camera.
+//
+// Comments are allowed in this file. Settings resolve in layers: built-in defaults,
+// then "defaults" below, then the matching entry in "cameras", then anything passed
+// on the command line. Each layer only overrides what it names, so a camera entry
+// that sets just "fps" keeps everything else from "defaults".
+//
+// A camera that is not listed here still works. It is called cam_<serial> instead of
+// having a rig name, and uses the defaults.
+//
+// The recorder looks for this file next to the executable, in a config/ folder beside
+// or above it, in the working directory, at BEHAVIOUR_CAMERA_CONFIG, or wherever
+// --config points.
+{
+  "defaults": {
+    "output_root": "E:/test_vid_output",
+    "fps": 60,
+
+    // Auto-exposure will not go below this. Raising it brightens a dark arena at the
+    // cost of motion blur, and caps the achievable frame rate (4000 us limits you to
+    // 250 fps).
+    "exposure_lower_limit_us": 4000,
+
+    // GPIO line driven as an output, one pulse per captured frame, which is what the
+    // DAQ timestamps to give every frame a time.
+    "strobe_line": 2,
+
+    // Frames the driver may hold while the writer is busy. The camera's own default
+    // is 10, which is a third of a second at 30 fps - short enough that an ordinary
+    // disk stall drops frames. 300 is about 10 seconds of slack at 30 fps and costs
+    // roughly 375 MB of RAM per camera.
+    "stream_buffers": 300,
+
+    "window": { "width": 800, "height": 600 },
+
+    // Preview refresh rate. Affects only what is drawn on screen, never what is
+    // recorded.
+    "display_fps": 30
+  },
+
+  "cameras": {
+    "22181614": { "rig": "1" },
+    "20530175": { "rig": "2" },
+    "24174008": { "rig": "3" },
+    "24243513": { "rig": "4" },
+    "24174020": { "rig": "openfield" },
+    "23606054": { "rig": "colour_camera" },
+
+    // 6.3 MP sensor: much larger frames, so it tops out near 60 fps and needs fewer
+    // buffers to hold the same number of seconds.
+    "21423798": { "rig": "6MP3_camera", "fps": 59.6, "stream_buffers": 120 },
+
+    // Bench camera on the development machine.
+    "26043809": { "rig": "bench" }
+  }
+}

@@ -1,15 +1,13 @@
-﻿// Standard library includes
-#include <iostream>
+// Standard library includes
 #include <chrono>
-#include <sstream>
-#include <fstream>
-#include <vector>
-#include <string>
 #include <cstdlib>
 #include <filesystem>
-
-// Platform-specific includes
-#include <direct.h>
+#include <fstream>
+#include <iostream>
+#include <sstream>
+#include <string>
+#include <thread>
+#include <vector>
 
 // Third-party library includes
 #include <GLFW/glfw3.h>  // Must be included before any OpenGL headers
@@ -21,6 +19,8 @@
 #include <Spinnaker.h>
 #include <SpinGenApi/SpinnakerGenApi.h>
 
+#include "config.h"
+
 using namespace Spinnaker;
 using namespace Spinnaker::GenApi;
 using namespace Spinnaker::GenICam;
@@ -28,155 +28,196 @@ using namespace std;
 using namespace std::chrono;
 using json = nlohmann::json;
 namespace fs = std::filesystem;
+using behaviour_camera::Settings;
 
-GLFWwindow* initializeOpenGL(int width, int height, const std::string& title)
+namespace {
+
+// Returns a Spinnaker image to the driver however the scope is left, including by an
+// exception. A frame that is not released is never reused, so a handful of leaked
+// frames starves the camera - which used to be possible whenever the display path
+// threw partway through handling one.
+class ScopedImage
 {
-    // Initialize GLFW
-    if (!glfwInit())
+public:
+    explicit ScopedImage(ImagePtr image) : image_(image) {}
+
+    ~ScopedImage()
     {
-        std::cerr << "Failed to initialize GLFW" << std::endl;
-        exit(EXIT_FAILURE);
+        try {
+            if (image_.IsValid()) {
+                image_->Release();
+            }
+        }
+        catch (Spinnaker::Exception&) {
+            // Nothing useful to do from a destructor, and throwing here would
+            // terminate the process.
+        }
     }
 
-    // Create a GLFW window
-    GLFWwindow* window = glfwCreateWindow(width, height, title.c_str(), NULL, NULL);
-    if (!window)
+    ScopedImage(const ScopedImage&) = delete;
+    ScopedImage& operator=(const ScopedImage&) = delete;
+
+    ImagePtr& get() { return image_; }
+
+private:
+    ImagePtr image_;
+};
+
+// Sends everything written to a stream to a second one as well, so console output is
+// also captured in a session log. Rig machines are launched without a console, where
+// otherwise every diagnostic message is lost precisely when it is wanted.
+class TeeBuffer : public std::streambuf
+{
+public:
+    TeeBuffer(std::streambuf* first, std::streambuf* second)
+        : first_(first), second_(second) {}
+
+protected:
+    int overflow(int ch) override
     {
-        std::cerr << "Failed to create GLFW window" << std::endl;
-        glfwTerminate();
-        exit(EXIT_FAILURE);
+        if (ch == traits_type::eof()) {
+            return !traits_type::eof();
+        }
+        const int a = first_->sputc(static_cast<char>(ch));
+        const int b = second_->sputc(static_cast<char>(ch));
+        return (a == traits_type::eof() || b == traits_type::eof()) ? traits_type::eof() : ch;
     }
 
-    glfwMakeContextCurrent(window);
-    glViewport(0, 0, width, height);
-    return window;
+    int sync() override
+    {
+        const int a = first_->pubsync();
+        const int b = second_->pubsync();
+        return (a == 0 && b == 0) ? 0 : -1;
+    }
+
+private:
+    std::streambuf* first_;
+    std::streambuf* second_;
+};
+
+// Redirects cout and cerr into a log file as well as the console, and puts them back
+// when it goes out of scope.
+class SessionLog
+{
+public:
+    explicit SessionLog(const fs::path& logPath)
+    {
+        file_.open(logPath, ios::out | ios::app);
+        if (!file_.is_open()) {
+            cerr << "Warning: could not open the session log " << logPath
+                 << "; messages will only go to the console." << endl;
+            return;
+        }
+
+        outTee_ = make_unique<TeeBuffer>(cout.rdbuf(), file_.rdbuf());
+        errTee_ = make_unique<TeeBuffer>(cerr.rdbuf(), file_.rdbuf());
+        oldOut_ = cout.rdbuf(outTee_.get());
+        oldErr_ = cerr.rdbuf(errTee_.get());
+    }
+
+    ~SessionLog()
+    {
+        if (oldOut_) cout.rdbuf(oldOut_);
+        if (oldErr_) cerr.rdbuf(oldErr_);
+    }
+
+    SessionLog(const SessionLog&) = delete;
+    SessionLog& operator=(const SessionLog&) = delete;
+
+private:
+    ofstream file_;
+    unique_ptr<TeeBuffer> outTee_;
+    unique_ptr<TeeBuffer> errTee_;
+    streambuf* oldOut_ = nullptr;
+    streambuf* oldErr_ = nullptr;
+};
+
+string currentDateTime()
+{
+    const auto now = system_clock::now();
+    const time_t nowTime = system_clock::to_time_t(now);
+    char buffer[80];
+    tm localTime{};
+    localtime_s(&localTime, &nowTime);
+    strftime(buffer, sizeof(buffer), "%y%m%d_%H%M%S", &localTime);
+    return string(buffer);
 }
 
-void causeSpinnakerException() {
-    throw Spinnaker::Exception(
-        __LINE__,                          // Current line number
-        __FILE__,                          // Current source file
-        __FUNCTION__,                      // Current function name
-        "Simulated resource conflict",     // Error message
-        Spinnaker::SPINNAKER_ERR_RESOURCE_IN_USE  // Error code
-    );
-}
+} // namespace
 
 class CameraRecorder
 {
 public:
-    // Constructor
     CameraRecorder(const string& mouse_ID, const string& start_time, const string& path,
-        const string& serial_number, float FPS, int windowWidth, int windowHeight)
+                   const string& serial_number, const Settings& settings)
         : mouse_ID(mouse_ID), start_time(start_time), path(path),
-        camSerial(serial_number), FPS(FPS), windowWidth(windowWidth),
-        windowHeight(windowHeight), frame_count(0)
+          camSerial(serial_number), settings(settings), rig(settings.rig),
+          FPS(settings.fps), windowWidth(settings.window_width),
+          windowHeight(settings.window_height), frame_count(0)
     {
-        system = System::GetInstance();
-        CameraList camList = system->GetCameras();
+        spinSystem = System::GetInstance();
+        CameraList camList = spinSystem->GetCameras();
 
-        // Which rig each camera sits on. This is only a naming table: it decides the
-        // window title and the signal-file names, nothing about how the camera is
-        // driven. An unlisted serial is therefore not an error — it records exactly
-        // the same, it just has no friendly name — so it gets one from its serial
-        // instead of being refused. Previously a new camera meant editing this list
-        // and redeploying to every rig machine before it could be used at all.
-        static const struct { const char* serial; const char* rig; } knownCameras[] = {
-            { "22181614", "1" },
-            { "20530175", "2" },
-            { "24174008", "3" },
-            { "24243513", "4" },
-            { "24174020", "openfield" },
-            { "23606054", "colour_camera" },
-            { "21423798", "6MP3_camera" },
-        };
+        title = "Rig " + rig + ". Press 'Esc' to stop session.";
 
-        for (const auto& known : knownCameras) {
-            if (camSerial == known.serial) {
-                rig = known.rig;
-                break;
-            }
-        }
-        if (rig.empty()) {
-            rig = "cam_" + camSerial;
-            cout << "Camera " << camSerial << " is not in the known-rig list; "
-                 << "calling it '" << rig << "'." << endl;
-        }
-
-        // Note: the frame rate is not clamped here. The rate a camera can sustain
-        // depends on its pixel format, ROI and exposure, so it is read from the
-        // device once it is open, in setCameraFrameRate below.
-
-        windowTitle << "Rig " << rig << ". Press 'Esc' to stop session.";
-        title = windowTitle.str();
-
-        // Use GetBySerial to get the camera
         pCam = camList.GetBySerial(camSerial);
+        camList.Clear();
 
         if (!pCam) {
-            cerr << "Error: Camera can't open\nexit" << endl;
-            throw runtime_error("Camera can't open");
+            throw runtime_error("No camera with serial " + camSerial +
+                                ". Run camera_probe to see which cameras are attached.");
         }
 
         pCam->Init();
 
-        // Assigning the result back to this->FPS matters. The constructor parameter
-        // is also called FPS and shadows the member, so the member keeps whatever
-        // was asked for unless it is set explicitly here — and the member is what
-        // gets written into the metadata JSON and reused by attemptRecovery(). Those
-        // used to disagree whenever a rate above the camera's maximum was requested.
-        this->FPS = static_cast<float>(setCameraFrameRate(FPS));
-        setGPIOLine2ToOutput();     // Set GPIO Line 2 to output
-        setExposureTimeLowerLimit(4000.0);  // Set exposure time lower limit
+        // Order matters here. Exposure and the stream buffers are set before the
+        // frame rate because the rate the camera will accept depends on them, and
+        // setCameraFrameRate clamps against what the camera reports at that moment.
+        setExposureTimeLowerLimit(settings.exposure_lower_limit_us);
+        setStrobeLineToOutput(settings.strobe_line);
+        setStreamBufferCount(settings.stream_buffers);
+
+        // Assigning the result back to this->FPS matters: the member is what gets
+        // written into the metadata and reused on recovery, so it has to hold the
+        // rate actually achieved rather than the one requested.
+        FPS = setCameraFrameRate(settings.fps);
 
         INodeMap& nodeMap = pCam->GetNodeMap();
 
-        // Set acquisition mode to continuous
         CEnumerationPtr ptrAcquisitionMode = nodeMap.GetNode("AcquisitionMode");
         if (!IsReadable(ptrAcquisitionMode) || !IsWritable(ptrAcquisitionMode)) {
-            cerr << "Error: Unable to set acquisition mode to continuous." << endl;
             throw runtime_error("Unable to set acquisition mode to continuous");
         }
 
-        CEnumEntryPtr ptrAcquisitionModeContinuous =
-            ptrAcquisitionMode->GetEntryByName("Continuous");
+        CEnumEntryPtr ptrAcquisitionModeContinuous = ptrAcquisitionMode->GetEntryByName("Continuous");
         if (!IsReadable(ptrAcquisitionModeContinuous)) {
-            cerr << "Error: Unable to get or set acquisition mode to continuous." << endl;
             throw runtime_error("Unable to set acquisition mode to continuous");
         }
-
-        const int64_t acquisitionModeContinuous = ptrAcquisitionModeContinuous->GetValue();
-        ptrAcquisitionMode->SetIntValue(acquisitionModeContinuous);
+        ptrAcquisitionMode->SetIntValue(ptrAcquisitionModeContinuous->GetValue());
 
         pCam->BeginAcquisition();
         acquiring = true;
 
-        imageWidth = pCam->Width.GetValue();
-        imageHeight = pCam->Height.GetValue();
-        pixelFormat = pCam->PixelFormat.GetCurrentEntry()->GetSymbolic();
+        imageWidth = static_cast<size_t>(pCam->Width.GetValue());
+        imageHeight = static_cast<size_t>(pCam->Height.GetValue());
+        pixelFormat = string(pCam->PixelFormat.GetCurrentEntry()->GetSymbolic().c_str());
 
-        // Open the binary file for writing
-        stringstream binFilename;
-        binFilename << path << "/" + start_time + "_" + mouse_ID + "_binary_video.bin";
-        imageFile.open(binFilename.str(), ios::binary | ios::out);
+        const fs::path binFilename =
+            fs::path(path) / (start_time + "_" + mouse_ID + "_binary_video.bin");
+        imageFile.open(binFilename, ios::binary | ios::out);
         if (!imageFile.is_open()) {
-            cerr << "Error: Could not open binary file for writing." << endl;
-            throw runtime_error("Could not open binary file for writing");
+            throw runtime_error("Could not open the binary video file for writing: " +
+                                binFilename.string());
         }
+
+        cout << "Recording rig " << rig << " from camera " << camSerial << ": "
+             << imageWidth << "x" << imageHeight << " " << pixelFormat
+             << " at " << FPS << " fps" << endl;
     }
 
-    // Destructor
-    //
     // Every Spinnaker call here can throw, and a destructor is implicitly noexcept:
     // an escaping exception calls std::terminate, which showed up as the process
-    // dying with 0xC0000409 at the end of every otherwise successful session. The
-    // data was always safe — it is written and the finished-signal file created
-    // before this runs — but the exit code said the run had failed, and a launcher
-    // checking it could not tell a real failure from a normal finish.
-    //
-    // Two things fix it: only end acquisition if it is actually running (captureFrames
-    // has usually ended it already, and ending it twice is what threw), and let
-    // nothing escape.
+    // dying with 0xC0000409 at the end of every otherwise successful session.
     ~CameraRecorder()
     {
         try {
@@ -192,8 +233,7 @@ public:
             cerr << "Warning: error shutting the camera down: " << e.what() << endl;
         }
 
-        // Released whether or not the above succeeded: the system instance must
-        // outlive every camera reference, so this has to happen after pCam is gone.
+        // The system instance must outlive every camera reference.
         pCam = nullptr;
 
         if (imageFile.is_open()) {
@@ -201,8 +241,8 @@ public:
         }
 
         try {
-            if (system) {
-                system->ReleaseInstance();
+            if (spinSystem) {
+                spinSystem->ReleaseInstance();
             }
         }
         catch (Spinnaker::Exception& e) {
@@ -210,20 +250,25 @@ public:
         }
     }
 
-    void startRecording(bool show_frame, bool save_video)
+    // True if the session ran to a normal stop, false if it was cut short.
+    bool startRecording(bool show_frame, bool save_video)
     {
         frame_IDs.clear();
-        timer_start_time = high_resolution_clock::now();
         saveData();
 
-        // Start the capture loop
-        captureFrames(show_frame, save_video);
+        const bool completed = captureFrames(show_frame, save_video);
 
         end_time = currentDateTime();
+        completedNormally = completed;
         saveData();
 
-        // Create the signal file to indicate that tracking has finished
+        reportSummary();
+
+        // Written whatever the outcome, because the launcher waits for it and would
+        // otherwise hang forever on a failed session. The metadata records whether
+        // the session actually finished cleanly.
         createSignalFile();
+        return completed;
     }
 
 private:
@@ -232,275 +277,202 @@ private:
     string end_time;
     string path;
     string camSerial;
+    Settings settings;
     string rig;
-    float FPS;
-    size_t frame_count;
-    // Whether BeginAcquisition is currently in effect. Ending acquisition twice
-    // throws, and the second call used to come from the destructor.
-    bool acquiring = false;
-    CameraPtr pCam;
-    SystemPtr system;
-    vector<uint64_t> frame_IDs;
-    vector<uint64_t> frame_IDs_mem;
-    high_resolution_clock::time_point timer_start_time;
-    ostringstream windowTitle;
-    string title;
+    double FPS;
     int windowWidth;
     int windowHeight;
-    size_t imageWidth;
-    size_t imageHeight;
-    string pixelFormat;
-    ofstream imageFile;  // Binary file to store image data
-    const int SIGNAL_CHECK_INTERVAL = 30;  // Check for signal every 30 frames
+    size_t frame_count;
 
-    const size_t bufferSize = 200;
+    bool acquiring = false;
+    bool completedNormally = false;
+    string abortReason;
+
+    CameraPtr pCam;
+    SystemPtr spinSystem;
+
+    vector<uint64_t> frame_IDs;       // pending, flushed to the backup file in batches
+    vector<uint64_t> frame_IDs_mem;   // every ID, written into the metadata at the end
+    string title;
+    size_t imageWidth = 0;
+    size_t imageHeight = 0;
+    string pixelFormat;
+    ofstream imageFile;
+
+    // Frames the camera produced that never reached us, counted from gaps in the
+    // camera's own frame counter. Recorded so a session says plainly whether it lost
+    // anything, rather than leaving it to be discovered during analysis.
+    int64_t droppedFrames = 0;
+    int64_t incompleteFrames = 0;
+    uint64_t lastFrameID = 0;
+    bool haveLastFrameID = false;
+
+    static constexpr size_t kFrameIdFlushInterval = 200;
+    static constexpr auto kStopSignalCheckInterval = milliseconds(250);
+    static constexpr auto kMetadataSaveInterval = seconds(30);
+
+    // A single incomplete frame is ordinary packet loss and is not worth reacting to:
+    // re-initialising the camera over one costs seconds of recording and resets the
+    // frame-ID counter. Only a sustained run of failures means something is actually
+    // wrong.
+    static constexpr int kConsecutiveFailuresBeforeRecovery = 10;
+    int consecutiveFailures = 0;
 
     int recoveryAttempts = 0;
-    const int MAX_RECOVERY_ATTEMPTS = 3;
-    const std::chrono::seconds RECOVERY_COOLDOWN{ 5 };
+    static constexpr int kMaxRecoveryAttempts = 3;
+    static constexpr auto kRecoveryCooldown = seconds(5);
 
-    const size_t FRAMES_BEFORE_TEST_ERROR = 300; // Will trigger error after ~3 seconds at 60 FPS
-    size_t test_error_counter = 0;
-    bool test_error_triggered = false;
-
-
-
-    void captureFrames(bool show_frame, bool save_video) {
-        auto prev = high_resolution_clock::now();
-        int displayFPS = 30;  // Maximum display FPS
-        int frame_skip = int(1000 / displayFPS);  // Frame skip duration in ms
-
-        // Open the frame ID file in append mode
-        ofstream frameIDFile(path + "/" + start_time + "_" + mouse_ID + "_frame_ids_backup.txt", ios_base::app);
+    bool captureFrames(bool show_frame, bool save_video)
+    {
+        const fs::path frameIdPath =
+            fs::path(path) / (start_time + "_" + mouse_ID + "_frame_ids_backup.txt");
+        ofstream frameIDFile(frameIdPath, ios_base::app);
         if (!frameIDFile.is_open()) {
-            cerr << "Error: Could not open frame ID file for writing." << endl;
-            return;
+            abortReason = "could not open the frame ID backup file";
+            cerr << "Error: " << abortReason << endl;
+            return false;
         }
 
-        bool keepRunning = true;
-
-        // OpenGL: Initialize GLFW for OpenGL window management
         GLFWwindow* window = nullptr;
         if (show_frame) {
-            if (!glfwInit()) {
-                cerr << "Error: Failed to initialize GLFW" << endl;
-                return;
-            }
-
-            // Create a GLFW window
-            window = glfwCreateWindow(windowWidth, windowHeight, title.c_str(), NULL, NULL);
+            window = createWindow();
             if (!window) {
-                cerr << "Error: Failed to create GLFW window" << endl;
-                glfwTerminate();
-                return;
+                abortReason = "could not create the preview window";
+                return false;
             }
-
-            glfwMakeContextCurrent(window);
-            glViewport(0, 0, windowWidth, windowHeight);
-
-            // Set OpenGL clear color (background)
-            glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
         }
+
+        const auto displayInterval =
+            milliseconds(settings.display_fps > 0 ? 1000 / settings.display_fps : 33);
+        auto lastDisplay = steady_clock::now();
+        auto lastStopCheck = steady_clock::now();
+        auto lastMetadataSave = steady_clock::now();
+
+        bool keepRunning = true;
+        bool completed = true;
 
         while (keepRunning) {
             try {
+                ScopedImage frame(pCam->GetNextImage(1000));
 
-                ImagePtr pResultImage = pCam->GetNextImage(1000);
+                if (!frame.get().IsValid() || frame.get()->IsIncomplete()) {
+                    ++incompleteFrames;
+                    ++consecutiveFailures;
 
-                if (!pResultImage || pResultImage->IsIncomplete()) {
-                    if (pResultImage) pResultImage->Release();
-
-                    cerr << "Error: Image incomplete or null" << endl;
-
-                    if (!attemptRecovery()) {
-                        cerr << "Unable to recover camera. Stopping recording." << endl;
-                        keepRunning = false;
-                        break;
+                    if (consecutiveFailures < kConsecutiveFailuresBeforeRecovery) {
+                        // Drop it and carry on; the next frame is usually fine.
+                        continue;
                     }
 
-                    std::this_thread::sleep_for(RECOVERY_COOLDOWN);
+                    cerr << consecutiveFailures << " consecutive bad frames; "
+                         << "attempting camera recovery." << endl;
+                    if (!attemptRecovery()) {
+                        abortReason = "camera could not be recovered";
+                        cerr << "Error: " << abortReason << ". Stopping recording." << endl;
+                        completed = false;
+                        break;
+                    }
+                    consecutiveFailures = 0;
                     continue;
                 }
 
-                // Reset recovery attempts on successful frame
-                recoveryAttempts = 0;
+                consecutiveFailures = 0;
+                countDroppedFrames(frame.get()->GetFrameID());
 
-                if (save_video) {
-                    // Write raw image data to the binary file
-                    const char* imageData = reinterpret_cast<const char*>(pResultImage->GetData());
-                    size_t imageSize = pResultImage->GetImageSize();
-
-                    imageFile.write(imageData, imageSize);
-                    if (!imageFile.good()) {
-                        cerr << "Error: Failed to write image data to binary file." << endl;
-                        pResultImage->Release();
-                        keepRunning = false;
-                        break;
-                    }
-
-                    // Add frame ID to the list
-                    uint64_t frameID = pResultImage->GetFrameID();
-                    frame_IDs.push_back(frameID);       // Save to frame_IDs
-                    frame_IDs_mem.push_back(frameID);   // Save to frame_IDs_mem
-
-                    // Flush frame IDs to file if buffer is full
-                    if (frame_IDs.size() >= bufferSize) {
-                        for (const auto& id : frame_IDs) {
-                            frameIDFile << id << std::endl;
-                        }
-                        frameIDFile.flush();
-                        frame_IDs.clear();
-                    }
-                }
-
-                // Display frames at the specified display FPS
-                if (show_frame) {
-                    auto now = high_resolution_clock::now();
-                    double elapsedTime = duration_cast<milliseconds>(now - prev).count();
-
-                    if (elapsedTime >= frame_skip) {
-                        // Convert image to OpenGL texture format
-                        cv::Mat image(cv::Size(imageWidth, imageHeight), CV_8UC1,
-                            pResultImage->GetData(), pResultImage->GetStride());
-
-                        // Resize the image to fit the OpenGL window
-                        cv::Mat resizedImage;
-                        cv::resize(image, resizedImage, cv::Size(windowWidth, windowHeight));
-
-                        // Clear the OpenGL buffer
-                        glClear(GL_COLOR_BUFFER_BIT);
-
-                        // Use glDrawPixels to display the image
-                        glPixelZoom(1.0f, -1.0f);  // Flip the image vertically
-                        glRasterPos2i(-1, 1);      // Set image position
-                        glDrawPixels(resizedImage.cols, resizedImage.rows, GL_LUMINANCE, GL_UNSIGNED_BYTE, resizedImage.data);
-
-                        // Swap buffers to display the image
-                        glfwSwapBuffers(window);
-
-                        // Poll for input events
-                        glfwPollEvents();
-
-                        // check for signal file from startup program
-                        if (checkForStopSignal()) {
-                            keepRunning = false;
-                        }
-
-                        // Check if the user pressed the 'Esc' key or closed the window
-                        if (glfwGetKey(window, GLFW_KEY_ESCAPE) == GLFW_PRESS || glfwWindowShouldClose(window)) {
-                            keepRunning = false;
-                        }
-
-                        prev = now;  // Reset the previous time for the next displayed frame
-                    }
-                }
-
-                pResultImage->Release();
-                frame_count++;
-
-            }
-            catch (Spinnaker::Exception& e) {
-                cerr << "Camera error: " << e.what() << endl;
-
-                if (!attemptRecovery()) {
-                    cerr << "Unable to recover from error. Stopping recording." << endl;
-                    keepRunning = false;
+                if (save_video && !writeFrame(frame.get(), frameIDFile)) {
+                    abortReason = "failed to write image data to the binary file";
+                    cerr << "Error: " << abortReason << endl;
+                    completed = false;
                     break;
                 }
 
-                std::this_thread::sleep_for(RECOVERY_COOLDOWN);
+                const auto now = steady_clock::now();
+
+                if (show_frame && now - lastDisplay >= displayInterval) {
+                    drawPreview(window, frame.get());
+                    lastDisplay = now;
+                }
+
+                // Pumped every iteration rather than only when a frame is drawn, so
+                // the window stays responsive and Esc is seen promptly.
+                if (show_frame) {
+                    glfwPollEvents();
+                    if (glfwGetKey(window, GLFW_KEY_ESCAPE) == GLFW_PRESS ||
+                        glfwWindowShouldClose(window)) {
+                        cout << "Stop requested from the preview window." << endl;
+                        keepRunning = false;
+                    }
+                }
+
+                // On a wall-clock timer, and outside the preview branch. It used to
+                // be inside it and gated on a frame counter, so with the preview off
+                // there was no way to stop the recorder at all.
+                if (now - lastStopCheck >= kStopSignalCheckInterval) {
+                    lastStopCheck = now;
+                    if (stopSignalPresent()) {
+                        cout << "Stop signal file found." << endl;
+                        keepRunning = false;
+                    }
+                }
+
+                // Keeps the metadata usable if the machine dies mid-session.
+                if (now - lastMetadataSave >= kMetadataSaveInterval) {
+                    lastMetadataSave = now;
+                    saveData();
+                }
+
+                ++frame_count;
+            }
+            catch (Spinnaker::Exception& e) {
+                ++consecutiveFailures;
+                cerr << "Camera error: " << e.what() << endl;
+
+                if (consecutiveFailures < kConsecutiveFailuresBeforeRecovery) {
+                    continue;
+                }
+                if (!attemptRecovery()) {
+                    abortReason = string("unrecoverable camera error: ") + e.what();
+                    cerr << "Error: stopping recording." << endl;
+                    completed = false;
+                    break;
+                }
+                consecutiveFailures = 0;
             }
         }
 
         if (pCam && acquiring) {
-            pCam->EndAcquisition();
+            try {
+                pCam->EndAcquisition();
+            }
+            catch (Spinnaker::Exception& e) {
+                cerr << "Warning: error ending acquisition: " << e.what() << endl;
+            }
             acquiring = false;
         }
 
-        // After the loop, flush any remaining frame IDs in the buffer
-        if (!frame_IDs.empty()) {
-            for (const auto& frameID : frame_IDs) {
-                frameIDFile << frameID << std::endl;
-            }
-            frameIDFile.flush();
-            frame_IDs.clear();
-        }
+        flushFrameIds(frameIDFile);
+        frameIDFile.close();
 
-        // Cleanup OpenGL resources
+        imageFile.flush();
+
         if (window) {
             glfwDestroyWindow(window);
             glfwTerminate();
         }
 
-        frameIDFile.close();
+        return completed;
     }
 
-    bool attemptRecovery() {
-        if (recoveryAttempts >= MAX_RECOVERY_ATTEMPTS) {
-            cerr << "Max recovery attempts reached. Camera error persists." << endl;
-            return false;
-        }
-
-        try {
-            cerr << "Attempting camera recovery (attempt " << recoveryAttempts + 1 << " of " << MAX_RECOVERY_ATTEMPTS << ")..." << endl;
-
-            if (acquiring) {
-                pCam->EndAcquisition();
-                acquiring = false;
-            }
-            std::this_thread::sleep_for(std::chrono::milliseconds(500));
-
-            // Reset camera settings
-            pCam->DeInit();
-            std::this_thread::sleep_for(std::chrono::milliseconds(500));
-
-            pCam->Init();
-            setCameraFrameRate(FPS);
-            setGPIOLine2ToOutput();
-            setExposureTimeLowerLimit(4000.0);
-
-            pCam->BeginAcquisition();
-            acquiring = true;
-
-            // Test if camera is working
-            ImagePtr testImage = pCam->GetNextImage(1000);
-            if (testImage && !testImage->IsIncomplete()) {
-                testImage->Release();
-                cerr << "Camera recovered successfully" << endl;
-                recoveryAttempts = 0;  // Reset counter on successful recovery
-                return true;
-            }
-            testImage->Release();
-
-            recoveryAttempts++;
-            return false;
-
-        }
-        catch (Spinnaker::Exception& e) {
-            cerr << "Recovery attempt failed: " << e.what() << endl;
-            recoveryAttempts++;
-            return false;
-        }
-    }
-
-    bool checkForStopSignal() {
-        if (frame_count % SIGNAL_CHECK_INTERVAL != 0) {
-            return false;  // Only check every Nth frame
-        }
-
-        string stop_signal_path = fs::path(path).string() + "/stop_camera_" + rig + ".signal";
-        return fs::exists(stop_signal_path);
-    }
-
-    GLFWwindow* setupOpenGLWindow() {
+    GLFWwindow* createWindow()
+    {
         if (!glfwInit()) {
-            cerr << "Error: Failed to initialize GLFW" << endl;
+            cerr << "Error: failed to initialise GLFW" << endl;
             return nullptr;
         }
 
-        GLFWwindow* window = glfwCreateWindow(windowWidth, windowHeight, title.c_str(), NULL, NULL);
+        GLFWwindow* window = glfwCreateWindow(windowWidth, windowHeight, title.c_str(), nullptr, nullptr);
         if (!window) {
-            cerr << "Error: Failed to create GLFW window" << endl;
+            cerr << "Error: failed to create the preview window" << endl;
             glfwTerminate();
             return nullptr;
         }
@@ -508,56 +480,138 @@ private:
         glfwMakeContextCurrent(window);
         glViewport(0, 0, windowWidth, windowHeight);
         glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
-
         return window;
     }
 
-    bool saveFrame(ImagePtr& pResultImage, ofstream& frameIDFile) {
-        const char* imageData = reinterpret_cast<const char*>(pResultImage->GetData());
-        size_t imageSize = pResultImage->GetImageSize();
+    void drawPreview(GLFWwindow* window, const ImagePtr& image)
+    {
+        cv::Mat source(cv::Size(static_cast<int>(imageWidth), static_cast<int>(imageHeight)),
+                       CV_8UC1, image->GetData(), image->GetStride());
 
-        imageFile.write(imageData, imageSize);
+        cv::Mat resized;
+        cv::resize(source, resized, cv::Size(windowWidth, windowHeight));
+
+        glClear(GL_COLOR_BUFFER_BIT);
+        glPixelZoom(1.0f, -1.0f);
+        glRasterPos2i(-1, 1);
+        glDrawPixels(resized.cols, resized.rows, GL_LUMINANCE, GL_UNSIGNED_BYTE, resized.data);
+        glfwSwapBuffers(window);
+    }
+
+    bool writeFrame(const ImagePtr& image, ofstream& frameIDFile)
+    {
+        const char* data = reinterpret_cast<const char*>(image->GetData());
+        imageFile.write(data, static_cast<streamsize>(image->GetImageSize()));
         if (!imageFile.good()) {
             return false;
         }
 
-        uint64_t frameID = pResultImage->GetFrameID();
+        const uint64_t frameID = image->GetFrameID();
         frame_IDs.push_back(frameID);
         frame_IDs_mem.push_back(frameID);
 
-        if (frame_IDs.size() >= bufferSize) {
-            for (const auto& id : frame_IDs) {
-                frameIDFile << id << std::endl;
-            }
-            frameIDFile.flush();
-            frame_IDs.clear();
+        if (frame_IDs.size() >= kFrameIdFlushInterval) {
+            flushFrameIds(frameIDFile);
         }
-
         return true;
     }
 
-    void cleanupCapture(ofstream& frameIDFile, GLFWwindow* window) {
-        if (!frame_IDs.empty()) {
-            for (const auto& frameID : frame_IDs) {
-                frameIDFile << frameID << std::endl;
-            }
-            frameIDFile.flush();
-            frame_IDs.clear();
+    void flushFrameIds(ofstream& frameIDFile)
+    {
+        if (frame_IDs.empty()) {
+            return;
+        }
+        for (const uint64_t id : frame_IDs) {
+            frameIDFile << id << '\n';
+        }
+        frameIDFile.flush();
+        frame_IDs.clear();
+    }
+
+    // The camera's frame counter increments for every frame it produces, including
+    // ones lost in transfer, so a gap is a dropped frame.
+    void countDroppedFrames(uint64_t frameID)
+    {
+        if (haveLastFrameID && frameID > lastFrameID + 1) {
+            droppedFrames += static_cast<int64_t>(frameID - lastFrameID - 1);
+        }
+        lastFrameID = frameID;
+        haveLastFrameID = true;
+    }
+
+    bool attemptRecovery()
+    {
+        if (recoveryAttempts >= kMaxRecoveryAttempts) {
+            cerr << "Maximum recovery attempts reached; the camera fault persists." << endl;
+            return false;
         }
 
-        frameIDFile.close();
+        try {
+            cerr << "Attempting camera recovery (" << recoveryAttempts + 1 << " of "
+                 << kMaxRecoveryAttempts << ")..." << endl;
 
-        if (window) {
-            glfwDestroyWindow(window);
-            glfwTerminate();
+            if (acquiring) {
+                pCam->EndAcquisition();
+                acquiring = false;
+            }
+            std::this_thread::sleep_for(milliseconds(500));
+
+            // This resets the camera's frame-ID counter, so IDs after a recovery are
+            // no longer a continuous index. The metadata records that it happened.
+            pCam->DeInit();
+            std::this_thread::sleep_for(milliseconds(500));
+
+            pCam->Init();
+            setExposureTimeLowerLimit(settings.exposure_lower_limit_us);
+            setStrobeLineToOutput(settings.strobe_line);
+            setStreamBufferCount(settings.stream_buffers);
+            setCameraFrameRate(FPS);
+
+            pCam->BeginAcquisition();
+            acquiring = true;
+            ++cameraResets;
+            haveLastFrameID = false;   // the counter restarted; do not count the jump
+
+            ScopedImage test(pCam->GetNextImage(1000));
+            if (test.get().IsValid() && !test.get()->IsIncomplete()) {
+                cerr << "Camera recovered." << endl;
+                recoveryAttempts = 0;
+                return true;
+            }
+
+            ++recoveryAttempts;
+            std::this_thread::sleep_for(kRecoveryCooldown);
+            return false;
+        }
+        catch (Spinnaker::Exception& e) {
+            cerr << "Recovery attempt failed: " << e.what() << endl;
+            ++recoveryAttempts;
+            return false;
+        }
+    }
+
+    bool stopSignalPresent() const
+    {
+        error_code error;
+        return fs::exists(fs::path(path) / ("stop_camera_" + rig + ".signal"), error);
+    }
+
+    void reportSummary() const
+    {
+        cout << "\nSession summary\n"
+             << "  frames recorded   " << frame_IDs_mem.size() << "\n"
+             << "  dropped in transit " << droppedFrames << "\n"
+             << "  incomplete frames " << incompleteFrames << "\n"
+             << "  camera resets     " << cameraResets << "\n"
+             << "  finished normally " << (completedNormally ? "yes" : "no") << endl;
+        if (!completedNormally && !abortReason.empty()) {
+            cout << "  stopped because   " << abortReason << endl;
         }
     }
 
     void saveData()
     {
-        string file_name = start_time + "_" + mouse_ID + "_Tracker_data.json";
         json data;
-
         data["frame_rate"] = FPS;
         data["start_time"] = start_time;
         data["end_time"] = end_time;
@@ -566,228 +620,340 @@ private:
         data["pixel_format"] = pixelFormat;
         data["frame_IDs"] = frame_IDs_mem;
 
-        ofstream file(path + "/" + file_name);
-        file << data.dump(4);  // Pretty print with 4 spaces
-        file.close();
+        // Added alongside the original fields rather than replacing any, so existing
+        // analysis code reads this file exactly as before.
+        data["serial_number"] = camSerial;
+        data["rig"] = rig;
+        data["dropped_frames"] = droppedFrames;
+        data["incomplete_frames"] = incompleteFrames;
+        data["camera_resets"] = cameraResets;
+        data["completed_normally"] = completedNormally;
+        if (!abortReason.empty()) {
+            data["abort_reason"] = abortReason;
+        }
+        data["settings"] = settings.toJson();
+
+        // Written to a temporary file and moved into place, so a crash partway
+        // through cannot leave a truncated metadata file where a good one was.
+        const fs::path finalPath =
+            fs::path(path) / (start_time + "_" + mouse_ID + "_Tracker_data.json");
+        const fs::path tempPath = finalPath.string() + ".tmp";
+
+        {
+            ofstream file(tempPath);
+            if (!file) {
+                cerr << "Warning: could not write " << finalPath << endl;
+                return;
+            }
+            file << data.dump(4);
+        }
+
+        error_code error;
+        fs::rename(tempPath, finalPath, error);
+        if (error) {
+            cerr << "Warning: could not replace " << finalPath << ": " << error.message() << endl;
+        }
     }
 
-    string currentDateTime()
-    {
-        auto now = system_clock::now();
-        time_t now_time = system_clock::to_time_t(now);
-        char buffer[80];
-        tm localTime;
-        localtime_s(&localTime, &now_time);
-        strftime(buffer, sizeof(buffer), "%y%m%d_%H%M%S", &localTime);
-        return string(buffer);
-    }
-
-    // Sets the acquisition frame rate, clamped to what this camera currently
-    // permits, and returns the rate actually applied so the caller can record the
-    // truth rather than the request. The permitted range depends on pixel format,
-    // ROI and exposure time, which is why it is read from the device here instead
-    // of being kept in a table that has to be maintained by hand.
     double setCameraFrameRate(double frameRate)
     {
         INodeMap& nodeMap = pCam->GetNodeMap();
+
         CBooleanPtr ptrFrameRateEnable = nodeMap.GetNode("AcquisitionFrameRateEnable");
         if (IsWritable(ptrFrameRateEnable)) {
             ptrFrameRateEnable->SetValue(true);
         }
-        else {
-            throw runtime_error("Unable to enable frame rate");
-        }
 
         CFloatPtr ptrFrameRate = nodeMap.GetNode("AcquisitionFrameRate");
         if (!IsWritable(ptrFrameRate)) {
-            throw runtime_error("Unable to set frame rate");
+            throw runtime_error("Unable to set the frame rate on this camera");
         }
 
+        // The achievable range depends on pixel format, ROI and exposure, so it is
+        // read from the device rather than kept in a table that needs maintaining.
         const double minRate = ptrFrameRate->GetMin();
         const double maxRate = ptrFrameRate->GetMax();
         double applied = frameRate;
-        if (applied < minRate) {
-            applied = minRate;
-        }
-        else if (applied > maxRate) {
-            applied = maxRate;
-        }
+        if (applied < minRate) applied = minRate;
+        if (applied > maxRate) applied = maxRate;
 
         if (applied != frameRate) {
-            cout << "Requested " << frameRate << " fps; this camera allows "
-                 << minRate << " to " << maxRate << " fps, so recording at "
-                 << applied << " fps." << endl;
+            cout << "Requested " << frameRate << " fps; this camera allows " << minRate
+                 << " to " << maxRate << ", so recording at " << applied << " fps." << endl;
         }
 
         ptrFrameRate->SetValue(applied);
-
-        // Read it back rather than returning what we asked for. The camera
-        // quantises the rate to what its timing can actually produce, so a request
-        // for 60 may become 59.99, and the metadata should record the rate the
-        // frames were really captured at.
-        return ptrFrameRate->GetValue();
+        return ptrFrameRate->GetValue();   // the camera quantises it
     }
 
-    void setGPIOLine2ToOutput()
+    // Decides how many frames the driver may hold while we are busy writing. The
+    // camera default is 10, about a third of a second at 30 fps, which is why an
+    // ordinary disk stall used to cost frames.
+    void setStreamBufferCount(int count)
+    {
+        if (count <= 0) {
+            return;
+        }
+
+        INodeMap& streamNodeMap = pCam->GetTLStreamNodeMap();
+
+        CEnumerationPtr ptrBufferCountMode = streamNodeMap.GetNode("StreamBufferCountMode");
+        if (IsWritable(ptrBufferCountMode)) {
+            CEnumEntryPtr manual = ptrBufferCountMode->GetEntryByName("Manual");
+            if (IsReadable(manual)) {
+                ptrBufferCountMode->SetIntValue(manual->GetValue());
+            }
+        }
+
+        CIntegerPtr ptrBufferCount = streamNodeMap.GetNode("StreamBufferCountManual");
+        if (!IsWritable(ptrBufferCount)) {
+            cerr << "Warning: this camera will not let the buffer count be set; "
+                 << "leaving it at the default." << endl;
+            return;
+        }
+
+        const int64_t requested = count;
+        const int64_t clamped = std::min(std::max(requested, ptrBufferCount->GetMin()),
+                                         ptrBufferCount->GetMax());
+        ptrBufferCount->SetValue(clamped);
+
+        if (clamped != requested) {
+            cout << "Stream buffers: asked for " << requested << ", camera allows up to "
+                 << ptrBufferCount->GetMax() << ", using " << clamped << "." << endl;
+        }
+
+        CIntegerPtr ptrBufferResult = streamNodeMap.GetNode("StreamBufferCountResult");
+        const int64_t inUse = IsReadable(ptrBufferResult) ? ptrBufferResult->GetValue() : clamped;
+        cout << "Stream buffers: " << inUse << " ("
+             << (FPS > 0 ? inUse / FPS : 0.0) << " s of slack at the current rate)" << endl;
+    }
+
+    void setStrobeLineToOutput(int lineNumber)
     {
         INodeMap& nodeMap = pCam->GetNodeMap();
+        const string lineName = "Line" + to_string(lineNumber);
 
-        // Select Line 2
         CEnumerationPtr ptrLineSelector = nodeMap.GetNode("LineSelector");
-        if (IsWritable(ptrLineSelector)) {
-            CEnumEntryPtr ptrLine2 = ptrLineSelector->GetEntryByName("Line2");
-            if (IsReadable(ptrLine2)) {
-                ptrLineSelector->SetIntValue(ptrLine2->GetValue());
-            }
-            else {
-                throw runtime_error("Unable to select Line 2");
-            }
-        }
-        else {
+        if (!IsWritable(ptrLineSelector)) {
             throw runtime_error("Unable to access LineSelector");
         }
-
-        // Set Line Mode to Output
-        CEnumerationPtr ptrLineMode = nodeMap.GetNode("LineMode");
-        if (IsWritable(ptrLineMode)) {
-            CEnumEntryPtr ptrOutput = ptrLineMode->GetEntryByName("Output");
-            if (IsReadable(ptrOutput)) {
-                ptrLineMode->SetIntValue(ptrOutput->GetValue());
-            }
-            else {
-                throw runtime_error("Unable to set line mode to output");
-            }
+        CEnumEntryPtr ptrLine = ptrLineSelector->GetEntryByName(lineName.c_str());
+        if (!IsReadable(ptrLine)) {
+            throw runtime_error("Camera has no " + lineName + " to use as the frame strobe");
         }
-        else {
+        ptrLineSelector->SetIntValue(ptrLine->GetValue());
+
+        CEnumerationPtr ptrLineMode = nodeMap.GetNode("LineMode");
+        if (!IsWritable(ptrLineMode)) {
             throw runtime_error("Unable to access LineMode");
         }
-    }
-
-    void createSignalFile()
-    {
-        // Create the signal file in the specified path
-        string signal_file = fs::path(path).string() + "/rig_" + rig + "_camera_finished.signal";
-        ofstream file(signal_file);
-        file.close();
+        CEnumEntryPtr ptrOutput = ptrLineMode->GetEntryByName("Output");
+        if (!IsReadable(ptrOutput)) {
+            throw runtime_error("Unable to set " + lineName + " to output");
+        }
+        ptrLineMode->SetIntValue(ptrOutput->GetValue());
     }
 
     void setExposureTimeLowerLimit(double exposureTimeLowerLimit)
     {
         INodeMap& nodeMap = pCam->GetNodeMap();
 
-        // Set ExposureAuto to Continuous
         CEnumerationPtr ptrExposureAuto = nodeMap.GetNode("ExposureAuto");
-        if (IsWritable(ptrExposureAuto)) {
-            CEnumEntryPtr ptrExposureAutoContinuous =
-                ptrExposureAuto->GetEntryByName("Continuous");
-            if (IsReadable(ptrExposureAutoContinuous)) {
-                ptrExposureAuto->SetIntValue(ptrExposureAutoContinuous->GetValue());
-            }
-            else {
-                throw runtime_error("Unable to set ExposureAuto to Continuous");
-            }
-        }
-        else {
+        if (!IsWritable(ptrExposureAuto)) {
             throw runtime_error("Unable to access ExposureAuto");
         }
+        CEnumEntryPtr ptrContinuous = ptrExposureAuto->GetEntryByName("Continuous");
+        if (!IsReadable(ptrContinuous)) {
+            throw runtime_error("Unable to set ExposureAuto to Continuous");
+        }
+        ptrExposureAuto->SetIntValue(ptrContinuous->GetValue());
 
-        // Set AutoExposureExposureTimeLowerLimit
-        CFloatPtr ptrExposureTimeLowerLimit =
-            nodeMap.GetNode("AutoExposureExposureTimeLowerLimit");
-        if (!IsAvailable(ptrExposureTimeLowerLimit) || !IsWritable(ptrExposureTimeLowerLimit)) {
+        CFloatPtr ptrLowerLimit = nodeMap.GetNode("AutoExposureExposureTimeLowerLimit");
+        if (!IsReadable(ptrLowerLimit) || !IsWritable(ptrLowerLimit)) {
             throw runtime_error("Unable to access AutoExposureExposureTimeLowerLimit");
         }
 
-        double minExposureTimeLowerLimit = ptrExposureTimeLowerLimit->GetMin();
-        double maxExposureTimeLowerLimit = ptrExposureTimeLowerLimit->GetMax();
-
-        if (exposureTimeLowerLimit < minExposureTimeLowerLimit)
-            exposureTimeLowerLimit = minExposureTimeLowerLimit;
-        else if (exposureTimeLowerLimit > maxExposureTimeLowerLimit)
-            exposureTimeLowerLimit = maxExposureTimeLowerLimit;
-
-        ptrExposureTimeLowerLimit->SetValue(exposureTimeLowerLimit);
+        const double lowest = ptrLowerLimit->GetMin();
+        const double highest = ptrLowerLimit->GetMax();
+        double applied = exposureTimeLowerLimit;
+        if (applied < lowest) applied = lowest;
+        if (applied > highest) applied = highest;
+        ptrLowerLimit->SetValue(applied);
     }
+
+    void createSignalFile() const
+    {
+        const fs::path signalFile = fs::path(path) / ("rig_" + rig + "_camera_finished.signal");
+        ofstream file(signalFile);
+    }
+
+    int cameraResets = 0;
 };
 
-// Main function
-int main(int argc, char** argv)
+namespace {
+
+void printUsage()
+{
+    cout <<
+        "behaviour_camera - records from a Teledyne/FLIR camera\n"
+        "\n"
+        "  --serial_number <id>   camera to record from (required)\n"
+        "  --id <name>            subject ID, used in filenames (default NoID)\n"
+        "  --date <stamp>         date stamp for filenames (default: now)\n"
+        "  --path <dir>           output directory, created if missing\n"
+        "  --fps <rate>           frame rate; clamped to what the camera allows\n"
+        "  --windowWidth <px>     preview width\n"
+        "  --windowHeight <px>    preview height\n"
+        "  --config <file>        settings file (default: search for one)\n"
+        "  --no-preview           record without a preview window\n"
+        "  --help                 this message\n"
+        "\n"
+        "Settings not given here come from the config file; run camera_probe to see\n"
+        "which cameras are attached.\n";
+}
+
+struct Arguments
 {
     string mouse_ID = "NoID";
-    string date_time = "";
-    string path = "";
-    string serial_number = "";
-    float FPS = 60.0f;
-    int windowWidth = 800;  // Default window width
-    int windowHeight = 600; // Default window height
+    string date_time;
+    string path;
+    string serial_number;
+    string configPath;
+    optional<double> fps;
+    optional<int> windowWidth;
+    optional<int> windowHeight;
+    bool showPreview = true;
+};
 
-    // Parse command-line arguments
-    for (int i = 1; i < argc; i += 2) {
-        string arg = argv[i];
-        if (arg == "--id" && i + 1 < argc) {
-            mouse_ID = argv[i + 1];
+// Returns false if the program should stop: either --help, or an argument that could
+// not be understood. Unknown arguments are rejected rather than ignored, because the
+// old parser stepped two at a time and silently mis-read everything after a flag that
+// had no value.
+bool parseArguments(int argc, char** argv, Arguments& args, int& exitCode)
+{
+    for (int i = 1; i < argc; ++i) {
+        const string arg = argv[i];
+
+        if (arg == "--help" || arg == "-h") {
+            printUsage();
+            exitCode = 0;
+            return false;
         }
-        else if (arg == "--date" && i + 1 < argc) {
-            date_time = argv[i + 1];
+        if (arg == "--no-preview") {
+            args.showPreview = false;
+            continue;
         }
-        else if (arg == "--path" && i + 1 < argc) {
-            path = argv[i + 1];
+
+        if (i + 1 >= argc) {
+            cerr << "Error: " << arg << " needs a value.\n";
+            exitCode = 2;
+            return false;
         }
-        else if (arg == "--serial_number" && i + 1 < argc) {
-            serial_number = argv[i + 1];
+        const string value = argv[++i];
+
+        try {
+            if (arg == "--id") args.mouse_ID = value;
+            else if (arg == "--date") args.date_time = value;
+            else if (arg == "--path") args.path = value;
+            else if (arg == "--serial_number") args.serial_number = value;
+            else if (arg == "--config") args.configPath = value;
+            else if (arg == "--fps") args.fps = stod(value);
+            else if (arg == "--windowWidth") args.windowWidth = stoi(value);
+            else if (arg == "--windowHeight") args.windowHeight = stoi(value);
+            else {
+                cerr << "Error: unrecognised argument " << arg << "\n"
+                     << "Run with --help to see the accepted options.\n";
+                exitCode = 2;
+                return false;
+            }
         }
-        else if (arg == "--fps" && i + 1 < argc) {
-            FPS = stof(argv[i + 1]);
-        }
-        else if (arg == "--windowWidth" && i + 1 < argc) {
-            windowWidth = stoi(argv[i + 1]);
-        }
-        else if (arg == "--windowHeight" && i + 1 < argc) {
-            windowHeight = stoi(argv[i + 1]);
+        catch (const std::exception&) {
+            // stod/stoi throw on anything non-numeric; this used to escape main and
+            // surface as an unhandled exception.
+            cerr << "Error: " << arg << " expects a number, got '" << value << "'\n";
+            exitCode = 2;
+            return false;
         }
     }
 
-    if (date_time.empty()) {
-        auto now = system_clock::now();
-        time_t now_time = system_clock::to_time_t(now);
-        char buffer[80];
-        tm localTime;
-        localtime_s(&localTime, &now_time);
-        strftime(buffer, sizeof(buffer), "%y%m%d_%H%M%S", &localTime);
-        date_time = string(buffer);
+    return true;
+}
+
+} // namespace
+
+int main(int argc, char** argv)
+{
+    Arguments args;
+    int exitCode = 0;
+    if (!parseArguments(argc, argv, args, exitCode)) {
+        return exitCode;
     }
 
+    if (args.serial_number.empty()) {
+        cerr << "Error: --serial_number is required.\n"
+             << "Run camera_probe to see which cameras are attached, "
+             << "or behaviour_camera --help.\n";
+        return 2;
+    }
+
+    if (args.date_time.empty()) {
+        args.date_time = currentDateTime();
+    }
+
+    Settings settings;
+    try {
+        const behaviour_camera::ConfigFile config = behaviour_camera::findConfig(args.configPath);
+        settings = behaviour_camera::resolveSettings(config, args.serial_number);
+        if (config.found()) {
+            cout << "Settings from " << config.path << endl;
+        } else {
+            cout << "No config file found; using built-in defaults." << endl;
+        }
+    }
+    catch (const std::exception& e) {
+        cerr << "Error: " << e.what() << endl;
+        return 2;
+    }
+
+    // The command line is the last layer, overriding the file.
+    if (args.fps) settings.fps = *args.fps;
+    if (args.windowWidth) settings.window_width = *args.windowWidth;
+    if (args.windowHeight) settings.window_height = *args.windowHeight;
+
+    string path = args.path;
     if (path.empty()) {
-        // Default path if none is provided
-        path = "E:\\test_vid_output";  // Change this to your desired default path
-        path += "\\" + date_time + "_" + mouse_ID;
+        path = (fs::path(settings.output_root) / (args.date_time + "_" + args.mouse_ID)).string();
     }
 
-    // Create the output directory whichever way the path was arrived at. A path
-    // given with --path used to be left alone, so the only sign that it did not
-    // exist was the binary file failing to open several steps later; and the old
-    // _mkdir call could not create a missing parent, nor tolerate the directory
-    // already being there.
+    // Created whichever way the path was arrived at. A path given with --path used to
+    // be left alone, so the only sign that it did not exist was the binary file
+    // failing to open several steps later.
     try {
         fs::create_directories(path);
     }
     catch (const fs::filesystem_error& e) {
-        cerr << "Error: unable to create output directory " << path << ": " << e.what() << endl;
-        return -1;
+        cerr << "Error: unable to create the output directory " << path << ": "
+             << e.what() << endl;
+        return 2;
     }
     if (!fs::is_directory(path)) {
         cerr << "Error: output path is not a directory: " << path << endl;
-        return -1;
+        return 2;
     }
 
+    // From here on, everything printed also lands in the session folder, which is the
+    // only record of what happened on a rig launched without a console.
+    SessionLog log(fs::path(path) / (args.date_time + "_" + args.mouse_ID + "_camera_log.txt"));
+
     try {
-        CameraRecorder camera(mouse_ID, date_time, path, serial_number, FPS, windowWidth, windowHeight);
-        camera.startRecording(true, true);
+        CameraRecorder camera(args.mouse_ID, args.date_time, path, args.serial_number, settings);
+        const bool completed = camera.startRecording(args.showPreview, true);
+        // Non-zero on an aborted session so a launcher can tell the difference. The
+        // finished-signal file is written either way.
+        return completed ? 0 : 1;
     }
     catch (const std::exception& e) {
         cerr << "Error: " << e.what() << endl;
-        return -1;
+        return 2;
     }
-
-    return 0;
 }

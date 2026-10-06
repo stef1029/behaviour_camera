@@ -134,7 +134,10 @@ endfunction()
 # ============================================================================
 # TARGETS
 # ============================================================================
-add_executable(behaviour_camera src/main.cpp)
+add_executable(behaviour_camera
+    src/main.cpp
+    src/config.cpp
+)
 target_link_libraries(behaviour_camera PRIVATE
     project_options
     opencv_core
@@ -159,6 +162,7 @@ copy_runtime_dlls(camera_probe)
 # INSTALLATION
 # ============================================================================
 install(TARGETS behaviour_camera camera_probe RUNTIME DESTINATION bin)
+install(FILES config/behaviour_camera.json DESTINATION bin/config)
 
 # vcpkg's own DLLs (OpenCV, GLFW).
 install(FILES $<TARGET_RUNTIME_DLLS:behaviour_camera> DESTINATION bin)

@@ -133,20 +133,36 @@ Checks the binary holds exactly as many whole frames as the metadata claims, tha
 frame IDs increase strictly, how many frames were dropped, and the rate achieved.
 Exit codes: 0 consistent, 1 frames dropped but files sound, 2 inconsistent.
 
+## Configuration
+
+Rig names and camera settings live in [config/behaviour_camera.json](config/behaviour_camera.json),
+not in the code. Settings resolve in layers — built-in defaults, the file's
+`defaults` block, the per-camera block, then the command line — and each layer only
+overrides what it names. A camera that is not listed still records; it is just called
+`cam_<serial>`.
+
+The file is looked for next to the executable, in a `config/` folder beside or above
+it, in the working directory, at `BEHAVIOUR_CAMERA_CONFIG`, or wherever `--config`
+points. Whatever was resolved is written into each session's metadata, so a recording
+carries the settings it actually ran with.
+
+## Rig machine setup
+
+```sh
+powershell -ExecutionPolicy Bypass -File scripts\configure_rig.ps1
+```
+
+Reports the Windows settings that affect capture reliability — power plan, USB
+selective suspend, antivirus exclusion, capture drive headroom — and changes nothing
+unless given `-Apply` (as Administrator).
+
 ## Known rough edges
 
 Recorded here so they are not rediscovered:
 
-- **Rig names are still a table in `src/main.cpp`.** An unlisted camera works fine,
-  it just gets called `cam_<serial>`. Moving this to a config file is the next job.
-- **Only 10 stream buffers.** The camera's default gives roughly 170 ms of slack at
-  60 fps, so any disk stall longer than that drops frames. Raising
-  `StreamBufferCountManual` is the cheapest available reliability win.
 - **Capture, disk writes and the preview all share one thread**, so a disk hiccup
-  stalls capture directly.
-- **One incomplete frame triggers a full camera re-initialisation** plus a 5 s
-  cooldown, turning a routine dropped packet into seconds of lost recording — and
-  resetting the camera's frame-ID counter, which breaks frame IDs as an index.
+  stalls capture directly. The stream buffers now absorb several seconds of it, but
+  the underlying design is still single-threaded.
 - `/Zc:__cplusplus` cannot be enabled: `SpinnakerPlatform.h` then expands its
   deprecation macros to `enum [[deprecated]]`, which MSVC rejects (C3837). See the
   comment in `CMakeLists.txt`.
