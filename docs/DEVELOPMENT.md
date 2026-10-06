@@ -234,8 +234,7 @@ Visual Studio all read it, so they cannot drift apart. Three presets:
 |---|---|
 | `ninja-release` | day-to-day work. RelWithDebInfo: optimised, with debug symbols |
 | `ninja-debug` | debugging. Debug CRT, links the debug Spinnaker library |
-| `vs2022` | generates a `.sln` on machines with Visual Studio 2022 |
-| `vs2026` | generates a `.sln` on machines with Visual Studio 2026 |
+| `vs2026` | generates a `.sln` for Visual Studio's debugger and profiler |
 
 Each preset builds into `out/build/<preset-name>/`, so switching between them never
 provokes the "generator does not match" error that comes of two generators sharing

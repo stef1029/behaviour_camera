@@ -19,8 +19,7 @@ From a terminal they take arguments:
 ```sh
 build.cmd                 # Release (RelWithDebInfo: optimised, with symbols)
 build.cmd debug           # Debug
-build.cmd vs              # generate a Visual Studio 2026 solution instead
-build.cmd vs2022          # ... or a Visual Studio 2022 one
+build.cmd vs              # generate a Visual Studio solution instead
 build.cmd clean           # wipe the build tree and rebuild
 
 test_camera.cmd list      # which cameras can I see?
@@ -69,8 +68,8 @@ Install the recommended extensions when prompted (CMake Tools and C/C++), then:
 - **Ctrl+Shift+B** builds.
 - **F5** debugs. Three launch configurations are set up: probe the camera, record a
   test session, or run whichever target is selected in the status bar.
-- The CMake Tools status bar switches between the `ninja-release`, `ninja-debug`,
-  `vs2022` and `vs2026` presets.
+- The CMake Tools status bar switches between the `ninja-release`, `ninja-debug`
+  and `vs2026` presets.
 
 `CMakePresets.json` is the single source of truth, so the command line, VS Code and
 Visual Studio all build identically. Visual Studio remains worth keeping for its
