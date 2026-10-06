@@ -165,8 +165,21 @@ copy_runtime_dlls(camera_probe)
 install(TARGETS behaviour_camera camera_probe RUNTIME DESTINATION bin)
 install(FILES config/behaviour_camera.json DESTINATION bin/config)
 
-# vcpkg's own DLLs (OpenCV, GLFW).
-install(FILES $<TARGET_RUNTIME_DLLS:behaviour_camera> DESTINATION bin)
+# vcpkg's own DLLs (OpenCV, GLFW and whatever they pull in).
+#
+# Installs what is actually sitting next to the built executable rather than
+# $<TARGET_RUNTIME_DLLS> again. The two are not equivalent: the post-build copy
+# resolves dependencies transitively, while the install genex listed only the
+# direct ones and left out zlib1.dll, which OpenCV needs. The result ran from the
+# build tree and failed from the install tree with 0xC0000135, DLL not found.
+# Copying the directory ships exactly the set that is known to work.
+# Globbed at install time rather than with install(DIRECTORY FILES_MATCHING),
+# which copies the right files but also recreates every traversed subdirectory,
+# leaving empty CMakeFiles/ and pkgRedirects/ folders in the install tree.
+install(CODE "
+    file(GLOB _runtime_dlls \"$<TARGET_FILE_DIR:behaviour_camera>/*.dll\")
+    file(INSTALL \${_runtime_dlls} DESTINATION \"\${CMAKE_INSTALL_PREFIX}/bin\")
+")
 
 # The Spinnaker installer already puts its runtime on the system PATH, so this
 # is off by default: copying it adds ~300 MB of DLLs, most of them GUI code this

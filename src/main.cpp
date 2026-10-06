@@ -856,6 +856,7 @@ struct Arguments
     string serial_number;
     string configPath;
     string mode;
+    string rig;
     optional<double> fps;
     optional<int> windowWidth;
     optional<int> windowHeight;
@@ -895,6 +896,7 @@ bool parseArguments(int argc, char** argv, Arguments& args, int& exitCode)
             else if (arg == "--serial_number") args.serial_number = value;
             else if (arg == "--config") args.configPath = value;
             else if (arg == "--mode") args.mode = value;
+            else if (arg == "--rig") args.rig = value;
             else if (arg == "--fps") args.fps = stod(value);
             else if (arg == "--windowWidth") args.windowWidth = stoi(value);
             else if (arg == "--windowHeight") args.windowHeight = stoi(value);
@@ -954,6 +956,13 @@ int main(int argc, char** argv)
     }
 
     // The command line is the last layer, overriding the file.
+    // Overriding the rig name matters more than it looks. The launcher watches for
+    // rig_<name>_camera_finished.signal and writes stop_camera_<name>.signal, and it
+    // derives <name> from its own configuration. Letting it say so outright removes
+    // the need for two separate config files to agree, which they previously did
+    // only by coincidence - and a silent disagreement leaves the launcher waiting
+    // for a signal that is never written.
+    if (!args.rig.empty()) settings.rig = args.rig;
     if (!args.mode.empty()) settings.recording_mode = args.mode;
     if (args.fps) settings.fps = *args.fps;
     if (args.windowWidth) settings.window_width = *args.windowWidth;
