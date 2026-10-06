@@ -13,16 +13,20 @@ REM before vcvars had changed it.
 
 if defined BEHAVIOUR_CAMERA_ENV_READY goto :eof
 
-set "VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"
-if not exist "%VSWHERE%" (
+set "VSWHERE_DIR=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer"
+if not exist "%VSWHERE_DIR%\vswhere.exe" (
     echo ERROR: vswhere.exe not found. Is Visual Studio installed?
     exit /b 1
 )
 
-for /f "usebackq tokens=*" %%i in (`"%VSWHERE%" -latest -prerelease -products * ^
-    -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do (
-    set "VSPATH=%%i"
-)
+REM Capture vswhere's answer through a temp file rather than a for /f backtick
+REM command: a quoted executable path inside backticks parses awkwardly, and set /p
+REM sidesteps the question entirely.
+set "VSPATH_FILE=%TEMP%\behaviour_camera_vspath.txt"
+"%VSWHERE_DIR%\vswhere.exe" -latest -prerelease -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath > "%VSPATH_FILE%" 2>nul
+set "VSPATH="
+if exist "%VSPATH_FILE%" set /p VSPATH=<"%VSPATH_FILE%"
+del "%VSPATH_FILE%" 2>nul
 
 if not defined VSPATH (
     echo ERROR: No Visual Studio installation with the C++ toolset was found.
@@ -30,9 +34,22 @@ if not defined VSPATH (
     exit /b 1
 )
 
-call "%VSPATH%\VC\Auxiliary\Build\vcvars64.bat" >nul
+REM stderr is discarded as well as stdout. vcvars64.bat on VS 2026 prints
+REM "'vswhere.exe' is not recognized as an internal or external command" to stderr
+REM from inside its own detection chain, then carries on and sets the environment
+REM correctly (exit code 0, VCToolsInstallDir populated). Verified by calling
+REM vcvars64.bat on its own: the message is Microsoft's, not this script's. Left
+REM visible it appears on every build and looks like a failure. A real failure is
+REM still caught by the errorlevel check and by the compiler check below.
+call "%VSPATH%\VC\Auxiliary\Build\vcvars64.bat" >nul 2>nul
 if errorlevel 1 (
     echo ERROR: vcvars64.bat failed.
+    exit /b 1
+)
+
+REM Confirm the environment actually came up, since vcvars' own output is hidden.
+if not defined VCToolsInstallDir (
+    echo ERROR: the MSVC environment was not set up by vcvars64.bat.
     exit /b 1
 )
 
