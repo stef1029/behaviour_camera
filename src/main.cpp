@@ -20,6 +20,7 @@
 #include <SpinGenApi/SpinnakerGenApi.h>
 
 #include "config.h"
+#include "frame_sink.h"
 
 using namespace Spinnaker;
 using namespace Spinnaker::GenApi;
@@ -29,6 +30,7 @@ using namespace std::chrono;
 using json = nlohmann::json;
 namespace fs = std::filesystem;
 using behaviour_camera::Settings;
+using behaviour_camera::FrameSink;
 
 namespace {
 
@@ -202,17 +204,26 @@ public:
         imageHeight = static_cast<size_t>(pCam->Height.GetValue());
         pixelFormat = string(pCam->PixelFormat.GetCurrentEntry()->GetSymbolic().c_str());
 
-        const fs::path binFilename =
-            fs::path(path) / (start_time + "_" + mouse_ID + "_binary_video.bin");
-        imageFile.open(binFilename, ios::binary | ios::out);
-        if (!imageFile.is_open()) {
-            throw runtime_error("Could not open the binary video file for writing: " +
-                                binFilename.string());
+        if (settings.recording_mode == "video") {
+            // The container extension is appended by the sink, since it comes from
+            // the encoder settings.
+            const fs::path stem = fs::path(path) / (start_time + "_" + mouse_ID + "_video");
+            sink = behaviour_camera::makeVideoSink(stem, settings.video,
+                                                   static_cast<int>(imageWidth),
+                                                   static_cast<int>(imageHeight), FPS);
+        } else if (settings.recording_mode == "raw") {
+            const fs::path binFilename =
+                fs::path(path) / (start_time + "_" + mouse_ID + "_binary_video.bin");
+            sink = behaviour_camera::makeRawSink(binFilename);
+        } else {
+            throw runtime_error("Unknown recording mode '" + settings.recording_mode +
+                                "'. Use \"raw\" or \"video\".");
         }
 
         cout << "Recording rig " << rig << " from camera " << camSerial << ": "
              << imageWidth << "x" << imageHeight << " " << pixelFormat
              << " at " << FPS << " fps" << endl;
+        cout << "Writing " << sink->describe() << endl;
     }
 
     // Every Spinnaker call here can throw, and a destructor is implicitly noexcept:
@@ -236,10 +247,6 @@ public:
         // The system instance must outlive every camera reference.
         pCam = nullptr;
 
-        if (imageFile.is_open()) {
-            imageFile.close();
-        }
-
         try {
             if (spinSystem) {
                 spinSystem->ReleaseInstance();
@@ -256,7 +263,22 @@ public:
         frame_IDs.clear();
         saveData();
 
-        const bool completed = captureFrames(show_frame, save_video);
+        bool completed = captureFrames(show_frame, save_video);
+
+        // The whole analysis chain assumes output frame i is the i-th entry of
+        // frame_IDs. Checking it here, while the session is still in hand, is the
+        // difference between a known-bad recording and one that is discovered to be
+        // misaligned months later.
+        outputFrameCount = sink ? sink->frameCount() : -1;
+        if (outputFrameCount >= 0 &&
+            outputFrameCount != static_cast<int64_t>(frame_IDs_mem.size())) {
+            cerr << "Error: the output holds " << outputFrameCount << " frames but "
+                 << frame_IDs_mem.size() << " frame IDs were recorded. "
+                 << "They must match for frames to be mapped back to their timestamps."
+                 << endl;
+            abortReason = "output frame count does not match the number of frame IDs";
+            completed = false;
+        }
 
         end_time = currentDateTime();
         completedNormally = completed;
@@ -297,7 +319,7 @@ private:
     size_t imageWidth = 0;
     size_t imageHeight = 0;
     string pixelFormat;
-    ofstream imageFile;
+    unique_ptr<FrameSink> sink;
 
     // Frames the camera produced that never reached us, counted from gaps in the
     // camera's own frame counter. Recorded so a session says plainly whether it lost
@@ -453,7 +475,15 @@ private:
         flushFrameIds(frameIDFile);
         frameIDFile.close();
 
-        imageFile.flush();
+        // Closing the sink is what makes an encoder flush and finalise its
+        // container, so a failure here means the output is not trustworthy even if
+        // every frame was handed over successfully.
+        if (!sink->finish()) {
+            if (abortReason.empty()) {
+                abortReason = "the output could not be closed cleanly";
+            }
+            completed = false;
+        }
 
         if (window) {
             glfwDestroyWindow(window);
@@ -500,9 +530,7 @@ private:
 
     bool writeFrame(const ImagePtr& image, ofstream& frameIDFile)
     {
-        const char* data = reinterpret_cast<const char*>(image->GetData());
-        imageFile.write(data, static_cast<streamsize>(image->GetImageSize()));
-        if (!imageFile.good()) {
+        if (!sink->write(image->GetData(), image->GetImageSize())) {
             return false;
         }
 
@@ -630,6 +658,13 @@ private:
         data["completed_normally"] = completedNormally;
         if (!abortReason.empty()) {
             data["abort_reason"] = abortReason;
+        }
+        data["recording_mode"] = settings.recording_mode;
+        if (sink) {
+            data["output_file"] = sink->path().filename().string();
+        }
+        if (outputFrameCount >= 0) {
+            data["output_frame_count"] = outputFrameCount;
         }
         data["settings"] = settings.toJson();
 
@@ -788,6 +823,7 @@ private:
     }
 
     int cameraResets = 0;
+    int64_t outputFrameCount = -1;
 };
 
 namespace {
@@ -819,6 +855,7 @@ struct Arguments
     string path;
     string serial_number;
     string configPath;
+    string mode;
     optional<double> fps;
     optional<int> windowWidth;
     optional<int> windowHeight;
@@ -857,6 +894,7 @@ bool parseArguments(int argc, char** argv, Arguments& args, int& exitCode)
             else if (arg == "--path") args.path = value;
             else if (arg == "--serial_number") args.serial_number = value;
             else if (arg == "--config") args.configPath = value;
+            else if (arg == "--mode") args.mode = value;
             else if (arg == "--fps") args.fps = stod(value);
             else if (arg == "--windowWidth") args.windowWidth = stoi(value);
             else if (arg == "--windowHeight") args.windowHeight = stoi(value);
@@ -916,6 +954,7 @@ int main(int argc, char** argv)
     }
 
     // The command line is the last layer, overriding the file.
+    if (!args.mode.empty()) settings.recording_mode = args.mode;
     if (args.fps) settings.fps = *args.fps;
     if (args.windowWidth) settings.window_width = *args.windowWidth;
     if (args.windowHeight) settings.window_height = *args.windowHeight;

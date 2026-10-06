@@ -74,6 +74,23 @@ void applyLayer(const nlohmann::json& layer, Settings& settings)
     readIfPresent(layer, "stream_buffers", settings.stream_buffers);
     readIfPresent(layer, "display_fps", settings.display_fps);
 
+    if (layer.contains("recording") && layer.at("recording").is_object()) {
+        const nlohmann::json& recording = layer.at("recording");
+        readIfPresent(recording, "mode", settings.recording_mode);
+
+        if (recording.contains("video") && recording.at("video").is_object()) {
+            const nlohmann::json& video = recording.at("video");
+            readIfPresent(video, "ffmpeg", settings.video.ffmpeg);
+            readIfPresent(video, "codec", settings.video.codec);
+            readIfPresent(video, "preset", settings.video.preset);
+            readIfPresent(video, "tune", settings.video.tune);
+            readIfPresent(video, "qp", settings.video.qp);
+            readIfPresent(video, "gop", settings.video.gop);
+            readIfPresent(video, "container", settings.video.container);
+            readIfPresent(video, "extra_args", settings.video.extra_args);
+        }
+    }
+
     if (layer.contains("window") && layer.at("window").is_object()) {
         const nlohmann::json& window = layer.at("window");
         readIfPresent(window, "width", settings.window_width);
@@ -95,6 +112,15 @@ nlohmann::json Settings::toJson() const
         { "window_width", window_width },
         { "window_height", window_height },
         { "display_fps", display_fps },
+        { "recording_mode", recording_mode },
+        { "video", {
+            { "codec", video.codec },
+            { "preset", video.preset },
+            { "tune", video.tune },
+            { "qp", video.qp },
+            { "gop", video.gop },
+            { "container", video.container },
+        } },
     };
 }
 

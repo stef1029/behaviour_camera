@@ -25,6 +25,11 @@ MOUSE_ID = "test"               # goes into every filename in the session folder
 OUTPUT_ROOT = r"E:\test_vid_output"   # a session folder is created inside this
 FPS = 60.0                      # clamped to what the camera allows
 
+# How frames are stored. None uses whatever the config file says (currently "raw").
+#   "raw"    every frame to a .bin - biggest files, nothing touched
+#   "video"  encoded on the GPU - vastly smaller, and far less written to disk
+RECORDING_MODE: str | None = None
+
 WINDOW_WIDTH = 800              # preview window
 WINDOW_HEIGHT = 600
 
@@ -116,12 +121,17 @@ def main() -> int:
         "--windowWidth", str(WINDOW_WIDTH),
         "--windowHeight", str(WINDOW_HEIGHT),
     ]
+    if RECORDING_MODE:
+        command += ["--mode", RECORDING_MODE]
 
     print(f"Camera    : {SERIAL_NUMBER} at {FPS:g} fps")
     print(f"Recording : {session_dir}")
     print(f"Using     : {exe}")
-    # 1280x1024 Mono8 is 1.25 MiB a frame; worth knowing before a long session.
-    print(f"Disk rate : roughly {1.25 * FPS:.0f} MiB/s, {1.25 * FPS * 3.6:.0f} GB/hour")
+    print(f"Mode      : {RECORDING_MODE or 'from config'}")
+    # 1280x1024 Mono8 is 1.25 MiB a frame. Only meaningful for raw: encoding cuts
+    # the write rate by roughly a hundredfold, so quoting it would be misleading.
+    if RECORDING_MODE != "video":
+        print(f"Disk rate : up to {1.25 * FPS:.0f} MiB/s, {1.25 * FPS * 3.6:.0f} GB/hour if raw")
     print()
 
     if DURATION_SECONDS is None:

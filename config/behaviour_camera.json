@@ -31,6 +31,41 @@
     // roughly 375 MB of RAM per camera.
     "stream_buffers": 300,
 
+    "recording": {
+      // "raw"   every frame straight to a .bin, as this program has always done.
+      //         Largest files, no compression at all.
+      // "video" frames piped to ffmpeg and encoded on the GPU. Around 100x smaller
+      //         at the settings below, and the disk write rate falls with it, which
+      //         matters because disk stalls are what cost frames.
+      //
+      // Still "raw" by default until encoded output has been checked against the
+      // analysis pipeline. Switch a single session with --mode video.
+      "mode": "raw",
+
+      "video": {
+        "codec": "hevc_nvenc",      // GPU encoder; needs an NVIDIA card
+        "preset": "p5",
+        // Low-latency tune, and not cosmetic: presets above p1 enable B-frames, and
+        // NVENC refuses a GOP shorter than its B-frame count, so a short GOP is
+        // rejected outright without this.
+        "tune": "ll",
+
+        // Quality. Lower is better and larger; 23 measured about 20x smaller than
+        // raw all-intra, against 15x for the MJPG the old pipeline produced.
+        "qp": 23,
+
+        // Frames between keyframes. 1 makes every frame independently decodable,
+        // matching MJPG. 30 is a keyframe a second and several times smaller;
+        // seeking to an arbitrary frame then costs decoding up to 29 extra frames,
+        // which sequential reads such as DLC never pay.
+        "gop": 30,
+
+        // Matroska finalises as it goes, so an unclean exit still leaves a playable
+        // file. An mp4 written the same way would be unreadable.
+        "container": "mkv"
+      }
+    },
+
     "window": { "width": 800, "height": 600 },
 
     // Preview refresh rate. Affects only what is drawn on screen, never what is

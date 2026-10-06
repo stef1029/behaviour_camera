@@ -20,6 +20,7 @@ Exit codes: 0 = consistent, 1 = frames were dropped but the file is sound,
 from __future__ import annotations
 
 import json
+import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -96,7 +97,77 @@ def check(directory: Path) -> int:
 
     status = 0
 
-    # --- binary file size against the frame count ---------------------------
+    # --- the output holds one frame per recorded frame ID --------------------
+    # Which file that is depends on how the session was recorded. Raw sessions have
+    # a .bin whose size must divide into whole frames; encoded ones have a video
+    # whose packet count must match. Both are checking the same invariant: output
+    # frame i is the i-th entry of frame_IDs.
+    mode = meta.get("recording_mode", "raw")
+    video_path = next(iter(sorted(directory.glob("*_video.mkv"))
+                           + sorted(directory.glob("*_video.mp4"))), None)
+
+    if mode == "video" or (video_path is not None and not list(directory.glob("*_binary_video.bin"))):
+        status = check_video(directory, video_path, frame_ids, meta)
+    else:
+        status = check_raw(directory, width, height, frame_ids)
+
+    status = check_frame_ids(frame_ids, status)
+    status = check_rate(meta, frame_ids, requested_fps, status)
+
+    print()
+    if status == 0:
+        print("  Session is consistent: every frame accounted for.")
+    elif status == 1:
+        print("  Session is usable: the file and the metadata agree, but frames were")
+        print("  dropped in transfer. Frame IDs record which ones, so timing is intact.")
+    else:
+        print("  Session is INCONSISTENT. See the failures above before using this data.")
+    return status
+
+
+def count_video_frames(path: Path) -> int | None:
+    """Frames in a video container, counted without decoding it.
+
+    Counts packets rather than reading the header's frame count, which Matroska
+    leaves unset - and one video packet is one frame.
+    """
+    try:
+        result = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0", "-count_packets",
+             "-show_entries", "stream=nb_read_packets", "-of", "default=nk=1:nw=1", str(path)],
+            capture_output=True, text=True, timeout=300)
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return None
+    text = result.stdout.strip()
+    return int(text) if text.isdigit() else None
+
+
+def check_video(directory: Path, video_path, frame_ids, meta) -> int:
+    if video_path is None:
+        print("  MISSING   no video file, but the metadata says this was a video session")
+        return 2
+
+    size_mib = video_path.stat().st_size / 1048576
+    counted = count_video_frames(video_path)
+    settings = meta.get("settings", {}).get("video", {})
+    print(f"  video     {video_path.name}  {size_mib:.1f} MiB"
+          f"  ({settings.get('codec', '?')} qp{settings.get('qp', '?')} "
+          f"gop{settings.get('gop', '?')})")
+
+    if counted is None:
+        print("  note      could not count frames; is ffprobe on PATH?")
+        return 0
+    if counted != len(frame_ids):
+        print(f"  FAIL      {counted} frames in the video but {len(frame_ids)} frame IDs "
+              f"recorded. They must match for frames to map back to their timestamps.")
+        return 2
+
+    print(f"  OK        frame count matches the metadata ({counted} frames)")
+    return 0
+
+
+def check_raw(directory: Path, width: int, height: int, frame_ids) -> int:
+    status = 0
     bin_path = find_one(directory, "*_binary_video.bin", "binary video")
     if bin_path is None:
         status = 2
@@ -119,7 +190,10 @@ def check(directory: Path) -> int:
             status = 2
         elif not remainder:
             print(f"  OK        frame count matches the metadata ({whole} frames)")
+    return status
 
+
+def check_frame_ids(frame_ids, status: int) -> int:
     # --- frame IDs ----------------------------------------------------------
     backwards = [i for i in range(len(frame_ids) - 1) if frame_ids[i + 1] <= frame_ids[i]]
     if backwards:
@@ -146,7 +220,10 @@ def check(directory: Path) -> int:
                 print("            a gap of 50+ frames usually means the camera was "
                       "re-initialised, not a transient stall")
             status = max(status, 1)
+    return status
 
+
+def check_rate(meta, frame_ids, requested_fps, status: int) -> int:
     # --- achieved rate ------------------------------------------------------
     start = parse_timestamp(meta.get("start_time", ""))
     end = parse_timestamp(meta.get("end_time", ""))
@@ -168,15 +245,6 @@ def check(directory: Path) -> int:
                 print(f"  note      {shortfall:.0f}% below the requested rate")
     else:
         print("  note      start/end times missing or unparseable, cannot check the rate")
-
-    print()
-    if status == 0:
-        print("  Session is consistent: every frame accounted for.")
-    elif status == 1:
-        print("  Session is usable: the file and the metadata agree, but frames were")
-        print("  dropped in transfer. Frame IDs record which ones, so timing is intact.")
-    else:
-        print("  Session is INCONSISTENT. See the failures above before using this data.")
     return status
 
 

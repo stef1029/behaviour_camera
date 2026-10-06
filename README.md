@@ -92,23 +92,46 @@ out\build\ninja-release\behaviour_camera.exe --serial_number 26043809 --fps 60
 | `--path` | Output directory, created if missing | `E:\test_vid_output\{date}_{id}` |
 | `--fps` | Frame rate; clamped to what the camera allows | `60` |
 | `--windowWidth`, `--windowHeight` | Preview window size | `800` x `600` |
+| `--mode` | `raw` or `video` | from config |
+| `--config` | Settings file | searched for |
+| `--no-preview` | Record without a preview window | preview on |
 
 Stops on **Esc** in the preview window, or when a file named
 `stop_camera_<rig>.signal` appears in the output directory. On finishing it writes
 `rig_<rig>_camera_finished.signal`.
 
+### Recording modes
+
+| Mode | Output | Per camera at 30 fps | Notes |
+|---|---|---|---|
+| `raw` | `*_binary_video.bin` | ~141 GB/hour | Nothing touched. The default. |
+| `video` | `*_video.mkv` | ~1.4 GB/hour | HEVC on the GPU via ffmpeg + NVENC |
+
+`video` needs ffmpeg on PATH and an NVIDIA card. Encoder settings — codec, quality,
+GOP, container — live in the config file, so most sessions need no arguments; use
+`--mode video` to switch a single run.
+
+Measured on real behaviour footage: all-intra HEVC is about 20x smaller than raw
+(against 15x for the MJPG the old post-processing produced), and GOP 30 — a keyframe
+a second — is about 105x. Encoding also cuts the *write* rate by the same factor,
+which matters because disk stalls are what cost frames.
+
 Output per session:
 
 | File | Contents |
 |---|---|
-| `*_binary_video.bin` | Raw Mono8 frames, back to back, no header |
-| `*_Tracker_data.json` | Resolution, pixel format, frame rate, start/end time, frame IDs |
+| `*_binary_video.bin` or `*_video.mkv` | The frames |
+| `*_Tracker_data.json` | Resolution, pixel format, frame rate, start/end time, frame IDs, drop counts, resolved settings |
 | `*_frame_ids_backup.txt` | Frame IDs flushed during the session, so they survive a crash |
+| `*_camera_log.txt` | Everything the recorder printed |
 
-**Position in the `.bin` is the index that frame IDs refer to.** Frame *i* of the
-file is the *i*-th entry of `frame_IDs`, whose value identifies which frame the
-camera produced — and those values have gaps whenever a frame is lost in transfer.
-Never use a frame ID as a file offset.
+**Output frame *i* is the *i*-th entry of `frame_IDs`**, in either mode. The *value*
+there identifies which frame the camera produced, and those values have gaps whenever
+a frame is lost in transfer. Never use a frame ID as a file offset or a frame index.
+
+The recorder checks this invariant before it exits — for raw by dividing the file
+size, for video by counting packets with ffprobe — and records the result as
+`output_frame_count`. A mismatch is reported and gives a non-zero exit code.
 
 ### `camera_probe` — read-only diagnostic
 

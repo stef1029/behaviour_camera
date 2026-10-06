@@ -13,6 +13,8 @@
 
 #include <nlohmann/json.hpp>
 
+#include "frame_sink.h"
+
 #include <optional>
 #include <string>
 
@@ -33,6 +35,13 @@ struct Settings
     // default of 10 is only a third of a second at 30 fps, so a brief disk stall
     // costs frames; a few hundred buys seconds of slack for a trivial amount of RAM.
     int stream_buffers = 300;
+
+    // "raw" writes a .bin as this program always has; "video" pipes frames to
+    // ffmpeg and encodes them on the GPU, which is far smaller and writes far less
+    // to disk. Raw stays the default until the encoded output has been checked
+    // against the analysis pipeline.
+    std::string recording_mode = "raw";
+    VideoSettings video;
 
     int window_width = 800;
     int window_height = 600;

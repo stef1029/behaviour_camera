@@ -137,6 +137,7 @@ endfunction()
 add_executable(behaviour_camera
     src/main.cpp
     src/config.cpp
+    src/frame_sink.cpp
 )
 target_link_libraries(behaviour_camera PRIVATE
     project_options
