@@ -8,6 +8,7 @@ nlohmann::json Settings::toJson() const
         { "rig", rig },
         { "fps", fps },
         { "exposure_lower_limit_us", exposure_lower_limit_us },
+        { "exposure_upper_limit_us", exposure_upper_limit_us },
         { "strobe_line", strobe_line },
         { "stream_buffers", stream_buffers },
         { "window_width", window_width },

@@ -1,4 +1,5 @@
 // Standard library includes
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
@@ -182,7 +183,7 @@ public:
         // Exposure and the stream buffers go first because the frame rate the
         // camera will accept depends on them, and setCameraFrameRate clamps
         // against what the camera reports at that moment.
-        setExposureTimeLowerLimit(settings.exposure_lower_limit_us);
+        setAutoExposureLimits(settings.fps);
         setStrobeLineToOutput(settings.strobe_line);
         setStreamBufferCount(settings.stream_buffers);
         FPS = setCameraFrameRate(settings.fps);
@@ -763,7 +764,7 @@ private:
             std::this_thread::sleep_for(milliseconds(500));
 
             pCam->Init();
-            setExposureTimeLowerLimit(settings.exposure_lower_limit_us);
+            setAutoExposureLimits(FPS);
             setStrobeLineToOutput(settings.strobe_line);
             setStreamBufferCount(settings.stream_buffers);
             setCameraFrameRate(FPS);
@@ -958,7 +959,18 @@ private:
         ptrLineMode->SetIntValue(ptrOutput->GetValue());
     }
 
-    void setExposureTimeLowerLimit(double limit)
+    // Gap kept between one exposure ending and the next starting. The strobe
+    // line is high for the exposure plus ~200 us, and the DAQ counts frames by
+    // seeing it go low in between. 1000 us leaves ~0.8 ms low, 8 samples on the
+    // rigs' 10 kHz DAQs; 500 us left 3, which counted every frame but with
+    // little to spare. (The sensor itself needs only ~300 us.) A slower DAQ
+    // needs a lower ceiling, set with --exposure-max.
+    static constexpr double kExposureFrameMarginUs = 1000.0;
+
+    // Sets the auto-exposure range, holding the ceiling under the frame period
+    // so the requested rate is the rate recorded. Records what was applied back
+    // into settings, so the session metadata carries the real figures.
+    void setAutoExposureLimits(double frameRate)
     {
         INodeMap& nodeMap = pCam->GetNodeMap();
 
@@ -972,16 +984,35 @@ private:
         }
         ptrAuto->SetIntValue(ptrContinuous->GetValue());
 
-        CFloatPtr ptrLimit = nodeMap.GetNode("AutoExposureExposureTimeLowerLimit");
-        if (!IsReadable(ptrLimit) || !IsWritable(ptrLimit)) {
-            throw runtime_error("Unable to access AutoExposureExposureTimeLowerLimit");
+        CFloatPtr ptrUpper = nodeMap.GetNode("AutoExposureExposureTimeUpperLimit");
+        CFloatPtr ptrLower = nodeMap.GetNode("AutoExposureExposureTimeLowerLimit");
+        if (!IsWritable(ptrUpper) || !IsWritable(ptrLower)) {
+            throw runtime_error("Unable to access the auto-exposure limits");
         }
-        const double lo = ptrLimit->GetMin();
-        const double hi = ptrLimit->GetMax();
-        double applied = limit;
-        if (applied < lo) applied = lo;
-        if (applied > hi) applied = hi;
-        ptrLimit->SetValue(applied);
+
+        double upper = settings.exposure_upper_limit_us;
+        if (frameRate > 0) {
+            const double periodUs = 1e6 / frameRate;
+            upper = std::min(upper, periodUs - kExposureFrameMarginUs);
+        }
+        upper = std::clamp(upper, ptrUpper->GetMin(), ptrUpper->GetMax());
+        const double lower = std::clamp(std::min(settings.exposure_lower_limit_us, upper),
+                                        ptrLower->GetMin(), ptrLower->GetMax());
+
+        // The camera keeps lower <= upper at every step, so the order matters:
+        // lower first if the range is moving down, upper first if moving up.
+        if (lower > ptrUpper->GetValue()) {
+            ptrUpper->SetValue(upper);
+            ptrLower->SetValue(lower);
+        } else {
+            ptrLower->SetValue(lower);
+            ptrUpper->SetValue(upper);
+        }
+
+        settings.exposure_lower_limit_us = ptrLower->GetValue();
+        settings.exposure_upper_limit_us = ptrUpper->GetValue();
+        cout << "Auto-exposure: " << settings.exposure_lower_limit_us << " to "
+             << settings.exposure_upper_limit_us << " us" << endl;
     }
 
     void createSignalFile() const
@@ -1078,6 +1109,7 @@ void printUsage()
         "Camera\n"
         "  --fps <rate>           frame rate; clamped to what the camera allows\n"
         "  --exposure-min <us>    auto-exposure floor in microseconds\n"
+        "  --exposure-max <us>    auto-exposure ceiling; always kept under the frame period\n"
         "  --stream-buffers <n>   frames the driver may hold while writing\n"
         "  --strobe-line <n>      GPIO line pulsed once per frame\n"
         "\n"
@@ -1085,6 +1117,7 @@ void printUsage()
         "  --mode raw|video       .bin of raw frames, or GPU-encoded video\n"
         "  --qp <n>               encoder quality, lower is better (video mode)\n"
         "  --gop <n>              frames between keyframes (video mode)\n"
+        "  --preset p1..p7        NVENC preset; lower is faster (video mode)\n"
         "  --ring-buffer-mb <n>   RAM held between capture and writing\n"
         "\n"
         "Preview\n"
@@ -1111,6 +1144,8 @@ struct Arguments
     string rig;
     optional<double> fps;
     optional<double> exposureMin;
+    optional<double> exposureMax;
+    string preset;
     optional<int> streamBuffers;
     optional<int> strobeLine;
     optional<int> qp;
@@ -1164,6 +1199,8 @@ bool parseArguments(int argc, char** argv, Arguments& args, int& exitCode)
             else if (arg == "--rig") args.rig = value;
             else if (arg == "--fps") args.fps = stod(value);
             else if (arg == "--exposure-min") args.exposureMin = stod(value);
+            else if (arg == "--exposure-max") args.exposureMax = stod(value);
+            else if (arg == "--preset") args.preset = value;
             else if (arg == "--stream-buffers") args.streamBuffers = stoi(value);
             else if (arg == "--strobe-line") args.strobeLine = stoi(value);
             else if (arg == "--qp") args.qp = stoi(value);
@@ -1223,6 +1260,8 @@ int main(int argc, char** argv)
     if (!args.mode.empty())   settings.recording_mode = args.mode;
     if (args.fps)             settings.fps = *args.fps;
     if (args.exposureMin)     settings.exposure_lower_limit_us = *args.exposureMin;
+    if (args.exposureMax)     settings.exposure_upper_limit_us = *args.exposureMax;
+    if (!args.preset.empty()) settings.video.preset = args.preset;
     if (args.streamBuffers)   settings.stream_buffers = *args.streamBuffers;
     if (args.strobeLine)      settings.strobe_line = *args.strobeLine;
     if (args.qp)              settings.video.qp = *args.qp;

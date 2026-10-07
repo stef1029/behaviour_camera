@@ -31,7 +31,10 @@ struct VideoSettings
 {
     std::string ffmpeg = "ffmpeg";       // name on PATH, or a full path
     std::string codec = "hevc_nvenc";
-    std::string preset = "p5";
+    // p5 tops out at ~104 fps per stream with four 1280x1024 cameras on an RTX
+    // A4500, short of 120; p2 manages ~176 at the same constant QP, and the
+    // files come out the same size. Measured 2026-10-07.
+    std::string preset = "p2";
 
     // Low-latency tune. Needed, not cosmetic: presets p2-p7 enable B-frames, and
     // NVENC refuses a GOP shorter than its B-frame count, so without this an

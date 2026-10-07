@@ -35,6 +35,14 @@ struct Settings
     // the camera to 250 fps. Varies with each rig's illumination.
     double exposure_lower_limit_us = 4000.0;
 
+    // Auto-exposure will not go above this, and it is always held below the
+    // frame period whatever is set here. An exposure longer than one frame does
+    // not fail: the camera silently records at a lower rate instead, which is
+    // how a 120 fps request in a dim arena used to come out at 66-95 fps.
+    // Auto-gain makes up the brightness, at some cost in noise. 15000 is the
+    // camera's own default, so at 30 fps nothing changes.
+    double exposure_upper_limit_us = 15000.0;
+
     // GPIO line driven as an output once per captured frame, which is what the
     // DAQ timestamps to give every frame a time.
     int strobe_line = 2;

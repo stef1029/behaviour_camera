@@ -99,6 +99,8 @@ out\build\ninja-release\behaviour_camera.exe --serial_number 26043809 --fps 60
 | `--histogram` | Start with the exposure histogram showing | off |
 | `--rig` | Rig name used in the signal filenames | from the serial |
 | `--exposure-min` | Auto-exposure floor, microseconds | `4000` |
+| `--exposure-max` | Auto-exposure ceiling, microseconds; always held 1000 us under the frame period, so the DAQ sees the strobe go low between frames and so the requested rate is the rate recorded | `15000` |
+| `--preset` | NVENC preset, `p1` (fastest) to `p7` | `p2` |
 | `--stream-buffers` | Frames the driver may hold while writing | `300` |
 | `--strobe-line` | GPIO line pulsed once per frame | `2` |
 | `--qp`, `--gop` | Encoder quality and keyframe interval | `23`, `30` |
