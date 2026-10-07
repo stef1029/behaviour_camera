@@ -356,9 +356,20 @@ class PoseService:
     def keepalive_loop(self) -> None:
         """A throwaway inference now and then, so the GPU does not clock down.
 
-        Without this the first request after a quiet stretch can take several
-        times the steady-state figure -- and the quiet stretch is the inter-trial
-        interval, so that penalty would land on exactly the request that matters.
+        This is a fallback, not the fix. An idle GPU drops its graphics clock to
+        a few hundred MHz and its memory clock with it, and an inference once a
+        second then costs about ten times one run back to back -- measured at
+        8 ms against 94 ms. The inter-trial interval is exactly such a gap, so
+        the penalty would land on the request that matters most.
+
+        The real fix is locking both clocks, which makes latency flat at any
+        request rate for about 15 W: run ``scripts/configure_rig.ps1 -Apply``.
+        That needs administrator, so this process cannot do it, and when the
+        clocks are not locked it falls back to keeping the GPU awake by working
+        it. Measured, that needs an inference every 50 ms or so to be worth
+        anything -- a 0.5 s keepalive does nothing useful -- which is a real
+        slice of the GPU spent on nothing. Hence: cheap when the clocks are
+        locked, expensive only when it has to be.
         """
         import numpy as np
         blank = None
@@ -392,6 +403,7 @@ class PoseService:
             "crop_size": self.crop_size,
             "min_likelihood": self.min_likelihood,
             "ports_configured": bool(self.port_coordinates),
+            "gpu_clocks": self.engine.clock_state(),
             "model": info,
         }
 
@@ -511,6 +523,19 @@ def main() -> int:
           f"{info['precision']}, cuda_graph={info['cuda_graph']}")
     print(f"  loaded in {time.perf_counter() - started:.1f} s")
 
+    clocks = engine.clock_state()
+    if clocks is not None and not clocks["locked"]:
+        print(f"  WARNING: GPU clocks are idling "
+              f"({clocks['sm_mhz']}/{clocks['sm_max_mhz']} MHz graphics, "
+              f"{clocks['mem_mhz']}/{clocks['mem_max_mhz']} MHz memory).")
+        print(f"  Occasional inferences will cost several times what they should "
+              f"- up to 10x - because the GPU clocks down between them and is slow "
+              f"to come back.")
+        print(f"  Fix: run scripts/configure_rig.ps1 -Apply as Administrator.")
+    elif clocks is not None:
+        print(f"  GPU clocks locked ({clocks['sm_mhz']} MHz graphics, "
+              f"{clocks['mem_mhz']} MHz memory)")
+
     # Warmup before the socket opens, so nothing can ask for a heading until the
     # model has been proved to work and the cold start has been paid.
     if args.warmup_images:
@@ -537,6 +562,14 @@ def main() -> int:
     else:
         source = lambda: FrameOutReader(args.rig)
 
+    # With the clocks locked the GPU holds its speed on its own and the
+    # keepalive is only a cheap safety net. Without, it has to do the job by
+    # working the GPU, which needs to be far more frequent to achieve anything.
+    keepalive_s = 0.5 if (clocks is None or clocks["locked"]) else 0.05
+    if clocks is not None and not clocks["locked"]:
+        print(f"  keepalive every {keepalive_s * 1000:.0f} ms to hold the clocks up; "
+              f"lock them instead and this drops to {500:.0f} ms")
+
     service = PoseService(
         engine,
         source,
@@ -544,6 +577,7 @@ def main() -> int:
         crop_size=args.crop or None,
         min_likelihood=args.min_likelihood,
         log_path=Path(args.log) if args.log else None,
+        keepalive_s=keepalive_s,
     )
     # Attach now rather than on the first request. Replay mode in particular
     # reads every image off disk when it attaches, and paying that on the first

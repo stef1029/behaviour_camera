@@ -101,6 +101,7 @@ out\build\ninja-release\behaviour_camera.exe --serial_number 26043809 --fps 60
 | `--strobe-line` | GPIO line pulsed once per frame | `2` |
 | `--qp`, `--gop` | Encoder quality and keyframe interval | `23`, `30` |
 | `--no-preview` | Record without a preview window | preview on |
+| `--frame-out` | Publish frames to shared memory for live pose | off |
 
 Stops on **Esc** in the preview window, or when a file named
 `stop_camera_<rig>.signal` appears in the output directory. On finishing it writes
@@ -242,6 +243,75 @@ and worst are there because a long tail is a stall that nearly cost a frame,
 which is the warning before one that does.
 
 `--histogram` starts with the histogram already showing, for setting a camera up.
+
+## Live pose estimation
+
+Optional. A second process reads frames out of shared memory while the session
+records, runs DeepLabCut on demand, and tells the behaviour system which way the
+mouse is facing — so a protocol can hold a cue until the animal is looking the
+right way. Full design and measurements in **[docs/DLC_LIVE_PLAN.md](docs/DLC_LIVE_PLAN.md)**.
+
+The recording cannot suffer for it. The recorder publishes each frame to a
+lock-free shared memory block and never waits for, checks for, or can be blocked
+by a reader; everything else lives in a separate process, so a crash in PyTorch
+takes down live pose and nothing else.
+
+```sh
+# the recorder, publishing frames
+behaviour_camera.exe --serial_number 26043809 --rig rig3 --fps 100 --frame-out
+
+# the pose server, in an environment with torch and deeplabcut
+python python/pose_server.py --rig rig3 --model <dlc project folder>     --port 5803 --crop 640 --warmup-images <folder of reference mice>     --ports "840,100;375,100;160,520;410,920;860,880;1110,490"     --log session_pose.csv
+```
+
+Measured end to end on an RTX 4000 Ada at 100 fps, 1280x1024, with the GPU
+clocks locked:
+
+| | |
+|---|---|
+| Round trip at trial pacing (1 Hz) | median 11.7 ms, **p95 12.7 ms** |
+| Round trip sustained (20 Hz, 300 requests) | median 9.2 ms, **p95 10.7 ms** |
+| Copying a frame out of shared memory | 0.54 ms |
+| Effect on the recording | none: 0 dropped, ring peak 71 of 819 |
+
+Three things that are not obvious and cost real time to find:
+
+- **Lock the GPU clocks.** This is the largest single effect anywhere in this
+  work and it is pure configuration. An idle GPU drops to ~210 MHz graphics and
+  ~810 MHz memory, so an inference once a second — which is exactly how a
+  protocol uses this — costs **94 ms instead of 8 ms**. Locking both clocks makes
+  it a flat 10 ms at any request rate, for about 15 W. Locking only the graphics
+  clock is not enough; HRNet is memory-bound. `scripts/configure_rig.ps1 -Apply`
+  does it, and the pose server warns at startup if they are idling.
+- **CUDA graphs, not cropping, are what make this fast.** HRNet-w32 is over a
+  thousand kernel launches, so eager inference costs ~33 ms at *any* input size —
+  cropping a launch-bound model saves nothing. Capturing the forward pass as a
+  graph is a 5.5x speedup and is bit-identical to eager.
+- **`dlclive` is not the route.** Its latest release is 1.1.0, from the
+  TensorFlow era, and will not load a DeepLabCut 3 PyTorch snapshot. DeepLabCut
+  3's own inference API does.
+
+The first inference also costs 320–1300 ms against 8 ms warm, which is why there
+is a startup warmup; see the plan for that and for how the crop size was chosen.
+
+Checking it without a rig:
+
+```sh
+python scripts/test_frame_out.py --rig rig3         # is the block healthy?
+python scripts/pose_warmup_check.py --save out.png  # does the model work?
+python scripts/benchmark_pose.py                    # crop size vs time
+python tests/test_head_angle.py                     # does it match the analysis?
+python python/pose_server.py ... --replay <folder>  # serve frames, not a camera
+```
+
+`--replay` serves a folder of images instead of the camera, so a protocol can be
+developed and tested with real mice on a machine with no rig attached.
+
+The heading is computed exactly as `Session_nwb.find_angles` does it in
+hex_behav_analysis, including the spine-based ear-swap correction, and
+`tests/test_head_angle.py` proves the two agree by running both. If they ever
+diverge, no live decision can be checked against the recorded video afterwards,
+which is the whole point.
 
 ## Known rough edges
 

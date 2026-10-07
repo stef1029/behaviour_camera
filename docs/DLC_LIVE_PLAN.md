@@ -551,28 +551,53 @@ re-verify with `calibrate_port_coordinates` if a camera is ever moved.
 ## Latency budget at 100 fps - measured
 
 End to end through the real server and client, on real mouse footage at the 640 crop,
-40 requests:
+**with the GPU clocks locked** (see below -- this is not optional):
 
-| | |
-|---|---|
-| readings returned | 40/40 (100%) |
-| round trip | **median 11.9 ms, p95 25.6 ms** |
-| of which the model | median 10.3 ms |
+| pacing | requests | round trip | of which model |
+|---|---|---|---|
+| 20 Hz sustained | 300 | median 9.2 ms, **p95 10.7 ms**, worst 11.3 | 8.7 ms |
+| 1 Hz, like trials | 40 | median 11.7 ms, **p95 12.7 ms**, worst 15.6 | 10.0 ms |
 
-**p95 25.6 ms is inside the 30 ms target**, before the rig's own few milliseconds of
-command round trip.
+100% of requests returned a reading. **Comfortably inside the 30 ms target**, before
+the rig's own few milliseconds of command round trip.
 
-Against the camera itself, the frame-out half measured separately at 100 fps: copying
-the newest frame out of shared memory costs **median 0.59 ms, worst 1.88 ms**, and the
-recorder dropped nothing (0 in transit, 0 writer-behind, ring buffer peak 71 of 819).
+The frame-out half, measured separately against the camera at 100 fps: copying the
+newest frame out of shared memory costs **median 0.54 ms, worst 1.82 ms**, and the
+recorder dropped nothing (0 in transit, 0 writer-behind, ring peak 71 of 819).
 
-Two honest caveats.
+### The GPU clocks are the whole ball game
 
-**The cold first inference is 320-660 ms**, against 6-10 ms warm, because CUDA is
+This was the largest single effect found anywhere in this work, and it is pure
+configuration. An idle GPU drops its graphics clock to ~210 MHz and its memory clock to
+~810 MHz, and is slow enough to come back up that an occasional inference pays most of
+the cost. Measured on the RTX 4000 Ada, varying only the gap between requests:
+
+| gap | default clocks | clocks locked |
+|---|---|---|
+| back to back | 8.1 ms | 8.1 ms |
+| 50 ms | 10.2 ms | 9.7 ms |
+| 100 ms | 39.2 ms | 10.0 ms |
+| 200 ms | 46.1 ms | 10.1 ms |
+| 500 ms | 79.0 ms | 10.3 ms |
+| **1 s** | **94.2 ms** | **10.1 ms** |
+
+A protocol asks for a heading once or twice a trial. That is the right-hand end of this
+table -- the worst case by default and the best case by configuration. Unlocked, the
+system misses even the 100 ms ceiling; locked, it is flat at 10 ms at every rate.
+
+Both clocks matter and locking only one is not enough: with graphics locked but memory
+still idling it was still 25 ms at a one second gap, because HRNet is memory-bound.
+
+`scripts/configure_rig.ps1` reports the clock state and locks both with `-Apply`
+(Administrator, and it does not survive a reboot). The pose server checks at startup
+and says so loudly if they are idling, and falls back to a much more aggressive
+keepalive -- which works, but spends a fifth of the GPU doing nothing useful.
+
+### Two other things worth knowing
+
+**The cold first inference is 320-1300 ms**, against 8-10 ms warm, because CUDA is
 choosing convolution algorithms and capturing the graph. Without the warmup that lands
-on the first trial of a session. This is why the warmup is not a nicety, and why the
-keepalive exists: the first request after a quiet stretch would otherwise pay part of
-that again, and the quiet stretch is the inter-trial interval.
+on the first trial of a session.
 
 **Frame age adds up to one frame period.** A request lands at a uniformly random point
 in the frame period, so the newest frame is on average half a period old. At 100 fps

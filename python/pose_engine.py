@@ -370,6 +370,43 @@ class PoseEngine:
             timings.append(self.last_inference_ms)
         return timings
 
+    # ----- the GPU's idea of how fast it feels like going -----
+
+    @staticmethod
+    def clock_state() -> Optional[dict]:
+        """Current and maximum GPU clocks, or None if nvidia-smi will not say.
+
+        This matters more than it sounds. An idle GPU drops its graphics clock to
+        a few hundred MHz and its memory clock with it, and is slow to come back
+        up - so an inference that happens once a second costs several times what
+        the same inference costs back to back. Measured on an RTX 4000 Ada: 8 ms
+        continuous against 94 ms with a one second gap, entirely from clocks.
+
+        Locking both clocks makes it flat at any request rate. Nothing in this
+        process can do that - it needs administrator - so the most this can do is
+        notice and say so.
+        """
+        import subprocess
+        try:
+            out = subprocess.run(
+                ["nvidia-smi",
+                 "--query-gpu=clocks.sm,clocks.max.sm,clocks.mem,clocks.max.mem",
+                 "--format=csv,noheader,nounits"],
+                capture_output=True, text=True, timeout=5)
+            if out.returncode != 0:
+                return None
+            sm, sm_max, mem, mem_max = [
+                int(v.strip()) for v in out.stdout.strip().splitlines()[0].split(",")]
+        except Exception:                                     # noqa: BLE001
+            return None
+        return {
+            "sm_mhz": sm, "sm_max_mhz": sm_max,
+            "mem_mhz": mem, "mem_max_mhz": mem_max,
+            # Idle clocks sit at a small fraction of maximum, so anything near
+            # it on a quiet machine means they are pinned.
+            "locked": sm > sm_max * 0.6 and mem > mem_max * 0.6,
+        }
+
     # ----- description, for the session record -----
 
     def describe(self) -> dict:
