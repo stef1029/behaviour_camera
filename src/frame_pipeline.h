@@ -22,6 +22,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
@@ -203,6 +204,52 @@ private:
     uint64_t frameID_ = 0;
     bool fresh_ = false;
     std::atomic<bool> wanted_{ true };
+};
+
+// Spacing between arriving frames, over a short rolling window.
+//
+// The mean says almost nothing: a camera that mostly keeps up but stalls
+// occasionally has a healthy average and a long tail. The tail is the interesting
+// part, because a stall that did not quite cost a frame is the warning before one
+// that does.
+class IntervalStats
+{
+public:
+    void add(double milliseconds)
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (samples_.size() < kWindow) {
+            samples_.push_back(milliseconds);
+        } else {
+            samples_[next_] = milliseconds;
+        }
+        next_ = (next_ + 1) % kWindow;
+    }
+
+    // median, 99th percentile and worst, in milliseconds. All zero if no samples.
+    void snapshot(double& median, double& p99, double& worst) const
+    {
+        std::vector<double> sorted;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            sorted = samples_;
+        }
+        if (sorted.empty()) {
+            median = p99 = worst = 0.0;
+            return;
+        }
+        std::sort(sorted.begin(), sorted.end());
+        median = sorted[sorted.size() / 2];
+        p99 = sorted[std::min(sorted.size() - 1,
+                              static_cast<size_t>(sorted.size() * 0.99))];
+        worst = sorted.back();
+    }
+
+private:
+    static constexpr size_t kWindow = 512;
+    mutable std::mutex mutex_;
+    std::vector<double> samples_;
+    size_t next_ = 0;
 };
 
 // Everything the preview and the summary want to show. Atomic so they can be read

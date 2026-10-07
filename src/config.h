@@ -57,9 +57,8 @@ struct Settings
     // machine cost four times this.
     int ring_buffer_mb = 1024;
 
-    // Draw the arena alignment guide over the preview, for putting a camera back
-    // where it was last time.
-    bool arena_guide = false;
+    // Start with the exposure histogram visible, for setting a camera up.
+    bool show_histogram = false;
 
     int window_width = 800;
     int window_height = 600;

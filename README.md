@@ -94,7 +94,7 @@ out\build\ninja-release\behaviour_camera.exe --serial_number 26043809 --fps 60
 | `--windowWidth`, `--windowHeight` | Preview window size | `800` x `600` |
 | `--mode` | `raw` or `video` | `raw` |
 | `--ring-buffer-mb` | RAM held between capture and writing | `1024` |
-| `--arena-guide` | Draw the alignment guide on the preview | off |
+| `--histogram` | Start with the exposure histogram showing | off |
 | `--rig` | Rig name used in the signal filenames | from the serial |
 | `--exposure-min` | Auto-exposure floor, microseconds | `4000` |
 | `--stream-buffers` | Frames the driver may hold while writing | `300` |
@@ -214,10 +214,20 @@ dropped **deliberately and counted** as `dropped_no_buffer`, separately from
 recorded every session, so you can see how close you came even when nothing was
 lost — it is the best early warning there is.
 
-The preview shows all of it live: buffer occupancy, both drop counts, write rate,
-measured against target frame rate, disk time remaining, exposure and camera
-temperature. Plus an optional histogram for checking exposure while positioning a
-camera, and an arena guide for putting one back where it was.
+The preview shows all of it live, and is built around one question: is this
+recording healthy? A banner answers it at a glance - green, or red with the number
+of frames lost. Underneath are the numbers behind that: frame rate against target,
+buffer occupancy, both drop counts, write rate, disk time remaining, exposure and
+camera temperature.
+
+Two of them are traces over the last minute rather than single values, because a
+number tells you the state now and a trace tells you about the dip thirty seconds
+ago. The buffer trace plots the *peak* between samples, since the buffer fills and
+drains faster than the plot ticks and the spikes are the only thing worth seeing.
+Frame-interval median, p99 and worst are shown too: a long tail there is a stall
+that nearly cost a frame, which is the warning before one that does.
+
+`--histogram` starts with an exposure histogram showing, for setting a camera up.
 
 ## Known rough edges
 

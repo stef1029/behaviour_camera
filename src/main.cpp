@@ -40,7 +40,6 @@ using behaviour_camera::FrameQueue;
 using behaviour_camera::PreviewSlot;
 using behaviour_camera::Preview;
 using behaviour_camera::PreviewStatus;
-using behaviour_camera::ArenaGuide;
 
 namespace {
 
@@ -285,12 +284,11 @@ public:
         unique_ptr<Preview> preview;
         if (showPreview) {
             try {
-                ArenaGuide guide;
-                guide.enabled = settings.arena_guide;
                 preview = make_unique<Preview>(
                     settings.window_width, settings.window_height,
                     "Rig " + rig + " - " + mouse_ID,
-                    static_cast<int>(imageWidth), static_cast<int>(imageHeight), guide);
+                    static_cast<int>(imageWidth), static_cast<int>(imageHeight),
+                    settings.show_histogram);
             }
             catch (const std::exception& e) {
                 // A missing display should not stop a recording; it is only the
@@ -386,6 +384,14 @@ private:
                 }
 
                 consecutiveFailures = 0;
+
+                const auto arrival = steady_clock::now();
+                if (haveLastArrival) {
+                    intervals.add(duration<double, std::milli>(arrival - lastArrival).count());
+                }
+                lastArrival = arrival;
+                haveLastArrival = true;
+
                 const uint64_t frameID = frame.get()->GetFrameID();
                 countDroppedInTransit(frameID);
                 counters.framesCaptured.fetch_add(1);
@@ -603,6 +609,8 @@ private:
 
         status.exposureMicroseconds = lastExposure;
         status.temperatureCelsius = lastTemperature;
+        intervals.snapshot(status.intervalMedianMs, status.intervalP99Ms,
+                           status.intervalWorstMs);
         return status;
     }
 
@@ -997,6 +1005,10 @@ private:
     vector<uint64_t> pendingFrameIds;
     ofstream frameIdFile;
 
+    behaviour_camera::IntervalStats intervals;
+    steady_clock::time_point lastArrival;
+    bool haveLastArrival = false;
+
     uint64_t lastFrameID = 0;
     bool haveLastFrameID = false;
     int recoveryAttempts = 0;
@@ -1050,7 +1062,7 @@ void printUsage()
         "Preview\n"
         "  --windowWidth <px>     preview width\n"
         "  --windowHeight <px>    preview height\n"
-        "  --arena-guide          draw the arena alignment guide\n"
+        "  --histogram            start with the exposure histogram showing\n"
         "  --no-preview           record without a preview window\n"
         "\n"
         "  --help                 this message\n"
@@ -1078,7 +1090,7 @@ struct Arguments
     optional<int> windowWidth;
     optional<int> windowHeight;
     bool showPreview = true;
-    bool arenaGuide = false;
+    bool histogram = false;
 };
 
 // Returns false if the program should stop: either --help, or an argument that
@@ -1093,12 +1105,12 @@ bool parseArguments(int argc, char** argv, Arguments& args, int& exitCode)
             exitCode = 0;
             return false;
         }
-        if (arg == "--no-preview") {
-            args.showPreview = false;
+        if (arg == "--histogram") {
+            args.histogram = true;
             continue;
         }
-        if (arg == "--arena-guide") {
-            args.arenaGuide = true;
+        if (arg == "--no-preview") {
+            args.showPreview = false;
             continue;
         }
 
@@ -1184,7 +1196,7 @@ int main(int argc, char** argv)
     if (args.ringBufferMb)    settings.ring_buffer_mb = *args.ringBufferMb;
     if (args.windowWidth)     settings.window_width = *args.windowWidth;
     if (args.windowHeight)    settings.window_height = *args.windowHeight;
-    settings.arena_guide = args.arenaGuide;
+    settings.show_histogram = args.histogram;
 
     string path = args.path;
     if (path.empty()) {
