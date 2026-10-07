@@ -317,10 +317,13 @@ class PoseEngine:
         """
         from head_angle import Keypoint
 
+        # None means "whatever this engine was configured with"; 0 means "the
+        # whole frame, explicitly". Conflating the two is a good way to warm up
+        # the wrong input shape and then wonder where 300 ms went.
         size = crop_size if crop_size is not None else self.crop_size
         height, width = frame.shape[:2]
 
-        if size is None or size >= max(width, height):
+        if not size or size >= max(width, height):
             crop = Crop(0, 0, width, height)
             view = frame
         else:
@@ -354,8 +357,12 @@ class PoseEngine:
         """
         size = crop_size if crop_size is not None else self.crop_size
         if frame is None:
-            side = size or 512
-            frame = np.zeros((side, side), dtype=np.uint8)
+            if not size:
+                raise ValueError(
+                    "warmup needs either a frame or a crop size: with neither "
+                    "there is no way to know which input shape to warm, and "
+                    "warming the wrong one is worse than not warming at all")
+            frame = np.zeros((size, size), dtype=np.uint8)
 
         timings = []
         for _ in range(rounds):

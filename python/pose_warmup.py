@@ -68,12 +68,25 @@ def run_warmup(
     engine,
     reference_dir: str | Path,
     *,
-    crop_size: Optional[int] = None,
+    crop_size: int = 0,
+    live_crop_size: Optional[int] = None,
     port_coordinates: Optional[Sequence[tuple[float, float]]] = None,
     min_likelihood: float = 0.6,
     max_images: int = 9,
 ) -> WarmupResult:
-    """Infer over the reference images and build the montage to show."""
+    """Infer over the reference images and build the montage to show.
+
+    ``crop_size`` is what the reference images are run at, and defaults to the
+    whole frame: a reference image is a mouse wherever it happened to be, not a
+    mouse on the scales, so cropping to the centre would fail most of them and
+    report a working model as broken.
+
+    ``live_crop_size`` is the crop the session will actually use. It is warmed
+    separately on a blank frame, because a CUDA graph is captured per input
+    shape -- warming only the full frame would leave the first real request to
+    pay a 300 ms capture, which is the exact cost this whole function exists to
+    avoid.
+    """
     from head_angle import REQUIRED_PARTS, head_angle
     from pose_overlay import draw_pose, label_panel, montage
 
@@ -145,6 +158,10 @@ def run_warmup(
             (f"{elapsed:.1f} ms   p={worst_likelihood:.2f}", (200, 200, 200)),
         ], scale=1.6)
         panels.append(panel)
+
+    if live_crop_size is not None and live_crop_size != crop_size:
+        # Capture the graph for the shape the session will use.
+        engine.warmup(rounds=5, crop_size=live_crop_size)
 
     if result.timings:
         result.median_ms = statistics.median(result.timings)
