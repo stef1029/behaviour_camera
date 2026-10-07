@@ -13,13 +13,8 @@
       * Antivirus exclusion for the capture directory. Real-time scanning of a
         sustained write stream causes latency spikes, and a spike costs frames.
 
-      * Locked GPU clocks, for live pose estimation only. An idle GPU drops its
-        graphics clock to ~210 MHz and its memory clock to ~810 MHz, and takes
-        long enough to come back up that an occasional inference costs ten times
-        what a continuous one does. Measured on an RTX 4000 Ada: 8 ms back to
-        back, 94 ms with a one second gap between requests. Locking both clocks
-        makes it a flat 10 ms at any request rate, for about 15 W at idle. A rig
-        that is not doing live pose does not need this.
+    Only the settings that affect capture. A rig also doing live pose needs its
+    GPU clocks locked as well, which is PoseLink's scripts/configure_gpu.ps1.
 
     Reports what it finds first and changes nothing unless -Apply is given, so it is
     safe to run just to see how a machine is set up.
@@ -128,47 +123,6 @@ if ($volume) {
 }
 
 Write-Host ''
-Write-Host '=== GPU clocks (live pose only) ===' -ForegroundColor Cyan
-$smi = Get-Command nvidia-smi -ErrorAction SilentlyContinue
-if (-not $smi) {
-    Write-Host '  no nvidia-smi; skipping (not needed without live pose)'
-} else {
-    $q = (& nvidia-smi --query-gpu=name,clocks.sm,clocks.max.sm,clocks.mem,clocks.max.mem `
-            --format=csv,noheader,nounits) -split ',' | ForEach-Object { $_.Trim() }
-    if ($q.Count -ge 5) {
-        $name = $q[0]
-        $sm = [int]$q[1]; $smMax = [int]$q[2]
-        $mem = [int]$q[3]; $memMax = [int]$q[4]
-        Write-Host "  $name"
-        Write-Host "  graphics $sm MHz of $smMax max, memory $mem MHz of $memMax max"
-
-        # Idle clocks are a small fraction of maximum. Anything near maximum
-        # while the machine is doing nothing means they are already locked.
-        $locked = ($sm -gt ($smMax * 0.6)) -and ($mem -gt ($memMax * 0.6))
-        if ($locked) {
-            Write-Host '  clocks look locked up already' -ForegroundColor Green
-        } elseif ($Apply) {
-            # Lock to the highest clock the card actually sustains rather than
-            # its absolute maximum, which it will not hold anyway.
-            $smLock = [int]($smMax * 0.75)
-            & nvidia-smi -lgc "$smLock,$smLock" | Out-Null
-            $okSm = ($LASTEXITCODE -eq 0)
-            & nvidia-smi -lmc "$memMax,$memMax" | Out-Null
-            $okMem = ($LASTEXITCODE -eq 0)
-            if ($okSm -and $okMem) {
-                Write-Host "  locked graphics to $smLock MHz and memory to $memMax MHz" -ForegroundColor Green
-                Write-Host '  NOTE: this does not survive a reboot. Add it to a startup task,'
-                Write-Host '  or re-run this script, if the rig is restarted.'
-            } else {
-                Write-Host '  could not lock the clocks; some cards and drivers refuse' -ForegroundColor Yellow
-            }
-        } else {
-            Write-Host '  clocks are idling. For live pose this costs up to 10x on latency;' -ForegroundColor Yellow
-            Write-Host '  re-run with -Apply to lock them. Harmless to skip otherwise.' -ForegroundColor Yellow
-        }
-    }
-}
-
 Write-Host ''
 if (-not $Apply) {
     Write-Host 'Nothing was changed. Re-run as Administrator with -Apply to make these changes.' -ForegroundColor Cyan

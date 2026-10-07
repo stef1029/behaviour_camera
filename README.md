@@ -244,86 +244,35 @@ which is the warning before one that does.
 
 `--histogram` starts with the histogram already showing, for setting a camera up.
 
-## Live pose estimation
+## Sharing frames with other programs
 
-Optional. A second process reads frames out of shared memory while the session
-records, runs DeepLabCut on demand, and tells the behaviour system which way the
-mouse is facing — so a protocol can hold a cue until the animal is looking the
-right way. Full design and measurements in **[docs/DLC_LIVE_PLAN.md](docs/DLC_LIVE_PLAN.md)**.
+`--frame-out` publishes each captured frame to a named shared memory block, so
+another process can read what the camera is seeing while the session records.
+It is off by default and costs about 0.5 ms a frame when on.
 
-The recording cannot suffer for it. The recorder publishes each frame to a
-lock-free shared memory block and never waits for, checks for, or can be blocked
-by a reader; everything else lives in a separate process, so a crash in PyTorch
-takes down live pose and nothing else.
+The recording cannot suffer for it. The writer never waits for, checks for, or
+can be blocked by a reader: the synchronisation is a seqlock over two slots,
+which has no lock at all. The worst a misbehaving reader can do is notice it
+read a torn frame and try again. Measured at 100 fps with a reader attached,
+the recorder dropped nothing.
 
 ```sh
-# the recorder, publishing frames
 behaviour_camera.exe --serial_number 26043809 --rig rig3 --fps 100 --frame-out
-
-# the pose server, in an environment with torch and deeplabcut
-python python/pose_server.py --rig rig3 --model <dlc project folder>     --port 5803 --crop 640 --warmup-images <folder of reference mice>     --ports "840,100;375,100;160,520;410,920;860,880;1110,490"     --log session_pose.csv
 ```
 
-Measured end to end on an RTX 4000 Ada at 100 fps, 1280x1024, with the GPU
-clocks locked:
+The layout of the block is defined and documented in
+[src/frame_out.h](src/frame_out.h), which carries a version field that readers
+must check.
 
-| | |
-|---|---|
-| Round trip at trial pacing (1 Hz) | median 11.7 ms, **p95 12.7 ms** |
-| Round trip sustained (20 Hz, 300 requests) | median 9.2 ms, **p95 10.7 ms** |
-| Copying a frame out of shared memory | 0.54 ms |
-| Effect on the recording | none: 0 dropped, ring peak 71 of 819 |
+**Live pose estimation** is built on this, and lives in the **PoseLink** library
+in `hex_behav_control` alongside BehavLink and ScalesLink — not here, so this
+repository stays about running the camera. It reads the block, runs DeepLabCut
+on demand and tells a protocol which way the mouse is facing. See
+`hex_behav_control/PoseLink/README.md`.
 
-Three things that are not obvious and cost real time to find:
-
-- **Lock the GPU clocks.** This is the largest single effect anywhere in this
-  work and it is pure configuration. An idle GPU drops to ~210 MHz graphics and
-  ~810 MHz memory, so an inference once a second — which is exactly how a
-  protocol uses this — costs **94 ms instead of 8 ms**. Locking both clocks makes
-  it a flat 10 ms at any request rate, for about 15 W. Locking only the graphics
-  clock is not enough; HRNet is memory-bound. `scripts/configure_rig.ps1 -Apply`
-  does it, and the pose server warns at startup if they are idling.
-- **CUDA graphs, not cropping, are what make this fast.** HRNet-w32 is over a
-  thousand kernel launches, so eager inference costs ~33 ms at *any* input size —
-  cropping a launch-bound model saves nothing. Capturing the forward pass as a
-  graph is a 5.5x speedup and is bit-identical to eager.
-- **`dlclive` is not the route.** Its latest release is 1.1.0, from the
-  TensorFlow era, and will not load a DeepLabCut 3 PyTorch snapshot. DeepLabCut
-  3's own inference API does.
-
-The first inference also costs 320–1300 ms against 8 ms warm, which is why there
-is a startup warmup; see the plan for that and for how the crop size was chosen.
-
-A live window per rig, launched with the peripheral, shows what the model saw
-and what it worked out from it - heading, position, the angle and distance to
-every port - plus GPU health. It shows nothing about what the protocol then did,
-because the pose system is a perception service and is told nothing:
-
-```sh
-python python/pose_viewer.py --rig "Rig 3" --port 5803
-```
-
-It needs only a socket, so it runs in hexcontrol's own environment: no torch, no
-CUDA, no DeepLabCut.
-
-Checking it without a rig:
-
-```sh
-python scripts/test_frame_out.py --rig rig3         # is the block healthy?
-python scripts/pose_warmup_check.py --save out.png  # does the model work?
-python scripts/benchmark_pose.py                    # crop size vs time
-python tests/test_head_angle.py                     # does it match the analysis?
-python python/pose_server.py ... --replay <folder>  # serve frames, not a camera
-```
-
-`--replay` serves a folder of images instead of the camera, so a protocol can be
-developed and tested with real mice on a machine with no rig attached.
-
-The heading is computed exactly as `Session_nwb.find_angles` does it in
-hex_behav_analysis, including the spine-based ear-swap correction, and
-`tests/test_head_angle.py` proves the two agree by running both. If they ever
-diverge, no live decision can be checked against the recorded video afterwards,
-which is the whole point.
+A rig doing live pose also needs its GPU clocks locked, which is
+`PoseLink/scripts/configure_gpu.ps1` — worth up to 10x on inference latency and
+nothing to do with capture, which is why it is over there.
 
 ## Known rough edges
 
