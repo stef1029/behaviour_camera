@@ -294,6 +294,18 @@ Three things that are not obvious and cost real time to find:
 The first inference also costs 320–1300 ms against 8 ms warm, which is why there
 is a startup warmup; see the plan for that and for how the crop size was chosen.
 
+A live window per rig, launched with the peripheral, shows what the model saw
+and what it worked out from it - heading, position, the angle and distance to
+every port - plus GPU health. It shows nothing about what the protocol then did,
+because the pose system is a perception service and is told nothing:
+
+```sh
+python python/pose_viewer.py --rig "Rig 3" --port 5803
+```
+
+It needs only a socket, so it runs in hexcontrol's own environment: no torch, no
+CUDA, no DeepLabCut.
+
 Checking it without a rig:
 
 ```sh

@@ -18,7 +18,7 @@ finding 1. Phase 2, the live viewer and the snapshot API, is designed but not bu
 | Warmup self-test | built, 6/6 reference mice |
 | hexcontrol peripheral | built, worked protocol gated 12/12 |
 | On a real rig with a mouse | **not yet** |
-| Live viewer + snapshot API | **designed, not built** -- see Phase 2 below |
+| Live viewer + snapshot API | built, real window verified against real mice |
 
 **Targets:** 30 ms from "protocol asks" to "protocol has an angle". 100 ms is the
 ceiling. Cameras run at 60–120 fps, most likely 100.
@@ -698,11 +698,11 @@ finished and measured.
 
 ## Phase 2 - the snapshot API and the live viewer
 
-Designed, not built. Three mockups of the window are in `screenshots_temp/`:
-`20_dlc_live_window.png` (normal), `21_dlc_live_flip.png` (flip correction fired),
-`22_dlc_live_miss.png` (no reading, and a GPU in the state that causes it). Every
-keypoint and angle in them is real inference on real frames; only the trial labels and
-times are invented.
+**Built.** `screenshots_temp/30_pose_viewer_real.png` is a screenshot of the actual
+window running against real mouse footage - not a mockup. The three earlier mockups
+(`20_dlc_live_window.png`, `21_dlc_live_flip.png`, `22_dlc_live_miss.png`) are kept
+because they show the flip-corrected and failed states, which are awkward to stage on
+demand.
 
 ### The API: one snapshot, everything derived from it
 
@@ -759,45 +759,32 @@ describe a hexagon of known pixel radius - 466 px for rig 3 - so adding the real
 port-circle radius in mm to `pose_tracking:` makes mm-per-pixel fall out of a
 calibration that already exists.
 
-### How the viewer learns what the protocol decided
+### The viewer shows only what the image told it
 
-The hard part, and the reason this needs designing rather than just building.
+An earlier draft of this plan had the protocol annotating each snapshot with the port
+it went on to cue, so the window could display it. That is dropped, deliberately.
 
-The server knows the heading, the port angles, the position, the quality and the timing.
-It cannot know which port the protocol *chose*, what trial it is, or what was done with
-the answer - those are decided elsewhere, after the snapshot. So the protocol has to
-tell it, and the right mechanism depends entirely on **when the information exists**.
+It would have meant a bookkeeping call in every protocol, a second thing to keep in
+step with the first, and a pose log that was half perception and half hearsay. The
+pose system interprets images and returns what it found; it is told nothing and has no
+channel to be told anything. So the window shows the heading, the position, and the
+angle and distance to every port - all derived from the frame - and does not show which
+port was cued, because it does not know and should not.
 
-**Tier 1, known before the snapshot.** Pass it in. Costs nothing:
+Decisions and outcomes belong in the protocol's own trial record. Every snapshot
+carries a ``frame_id``, which is also in the video and the DAQ, so the two join
+afterwards without either having to know about the other.
 
-```python
-snap = self.pose.snapshot(trial=14, phase="cue_onset", target_port=4)
-```
+For the record, the rejected design had three tiers, by when the information exists:
+context passed into the `snapshot()` call for what the protocol already knew; a
+fire-and-forget `note()` afterwards for what it worked out from the snapshot; and
+nothing at all for the outcome seconds later, which would have meant holding a CSV row
+open and conflating a perception record with a behaviour one.
 
-This covers the common case where the protocol already knows which port it is gating on.
-
-**Tier 2, derived from the snapshot microseconds later.** Annotate it:
-
-```python
-target = choose_port(snap)
-snap.note(cue_port=target, decision="gated")
-```
-
-Fire-and-forget on the same socket - no reply is waited for, so about 0.1 ms - and it
-happens *after* the latency-critical part, so it costs the decision nothing. The server
-assigns each snapshot a monotonic id and `note()` uses it implicitly, so a protocol
-never handles one.
-
-**Tier 3, the outcome seconds later** - which port was touched, correct or not. This
-deliberately does **not** go in the pose log. The pose CSV is a record of perception,
-one row per snapshot, written promptly; the trial record is a record of behaviour.
-Holding a pose row open for seconds waiting on an outcome conflates two different things
-and risks losing rows to a crash. They join on `frame_id`, which is already in both and
-already identifies the frame uniquely.
-
-The *viewer* can still show tier 3, because display state does not have to match the
-CSV. A late `snap.note(touched_port=3, correct=False)` updates the viewer's ring for the
-history table even after the row has been flushed.
+It would have worked. It was dropped because every one of those tiers is a line a
+protocol author has to write and keep correct, in return for a column the analysis can
+reconstruct by joining on `frame_id` anyway. The pose system is easier to use and
+easier to trust when the only thing it can tell you is what it saw.
 
 **When the row is written.** Each row is held briefly - until the next snapshot or about
 2 s, whichever comes first - then written by the log thread that already exists. That
@@ -808,8 +795,8 @@ columns blank, which is also what happens if the protocol crashes mid-trial.
 plus a free-form `context` JSON column, so adding a field later does not mean changing
 the schema.
 
-A protocol that never calls `note()` works unchanged; the viewer simply shows no chosen
-port. Nothing here is required.
+None of that exists. The simplicity of not having it is worth more than the column it
+would have filled in.
 
 ### The viewer, and how it gets frames
 
@@ -853,30 +840,34 @@ fields would have caught the idle-downclock problem on the first session instead
 after a day of measurement. And NVENC runs on the same card as the inference, so if the
 encoder and the model ever contend, this is the only place it would show.
 
-### What changes where
+### What was built, and where
 
 | | |
 |---|---|
-| `pose_client.py` | `Reading` becomes `Snapshot`; port angles always present; `note()` |
-| `pose_server.py` | all port angles; snapshot ring; `recent` and `note` commands; held rows; optional JPEG saving |
+| `pose_client.py` | `Reading` becomes `Snapshot`; port angles and distances always present |
+| `pose_server.py` | all port angles and distances; snapshot ring; `recent` command; monitor snapshots; JPEG saving |
 | `pose_viewer.py` (new) | the DearPyGui window |
 | `pose_tracking.py` | launch a viewer per rig; `show_viewer` config |
 | `rig_config.py` | `show_viewer`, `save_snapshots`, `arena_radius_mm` |
+| `gpu_stats.py` (new) | NVML sampling for the health bar |
 | `pose_gated_cue.py` | rewritten against `snapshot()` |
 | new dependency | `nvidia-ml-py`, pure Python, in the server environment only |
 
-### Two open questions
+### Both open questions, settled
 
-**Live-only, or scrollable?** Live-only is much simpler: the latest snapshot plus a short
-history table, as mocked. Scrolling the whole session means keeping every JPEG in the
-viewer. The saved snapshots cover the look-back case, so live-only is the recommendation.
+**Live-only.** The latest snapshot plus a history table. Scrolling a whole session would
+mean holding every JPEG in the viewer, and the saved snapshots already cover looking
+back.
 
-**Should the viewer trigger its own snapshots?** Inference only happens on request today,
-so between trials the window would sit frozen on the last decision. A low-rate background
-snapshot purely for display - say 2 Hz, about 2% of the GPU - would let you watch the
-mouse and confirm tracking before a trial starts. Worth it for a monitor window, but it
-means the log needs a flag separating protocol requests from display ones, or the
-"snapshots taken" count stops meaning decisions.
+**The viewer does trigger its own snapshots**, at 2 Hz, so the window is not frozen on
+the last decision between trials. They are marked ``monitor`` and are deliberately kept
+out of the CSV: the log is a record of what the protocol asked for, and padding it with
+display frames would make the request count meaningless. The history table shows only
+protocol requests; the image panel shows whichever is newest and says which kind it is.
+
+None of it runs unless a window is open. The ``recent`` poll is what marks a viewer as
+attached, and with nothing attached the server does no drawing, no encoding and no
+background snapshots at all.
 
 ---
 

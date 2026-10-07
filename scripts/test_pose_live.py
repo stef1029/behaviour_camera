@@ -1,11 +1,11 @@
-"""End to end: camera, shared memory, model, heading. The number that matters.
+"""End to end: camera, shared memory, model, snapshot. The number that matters.
 
 Starts nothing itself -- the recorder and the pose server must already be
-running. Fires a burst of requests the way a protocol would and reports the
+running. Fires a burst of snapshots the way a protocol would and reports the
 round trip the protocol would actually experience, which is the figure the whole
 plan is written against.
 
-    python scripts/test_pose_live.py --port 5801 --requests 50
+    python scripts/test_pose_live.py --port 5803 --requests 50
 
 Exit codes: 0 within the 30 ms target, 1 within 100 ms but over target,
 2 over 100 ms or not working.
@@ -32,9 +32,8 @@ def main() -> int:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=5801)
     parser.add_argument("--requests", type=int, default=50)
-    parser.add_argument("--target-port", type=int, default=3)
     parser.add_argument("--interval", type=float, default=0.1,
-                        help="seconds between requests, imitating trial spacing")
+                        help="seconds between snapshots, imitating trial spacing")
     parser.add_argument("--max-age-ms", type=float, default=100.0)
     args = parser.parse_args()
 
@@ -47,11 +46,19 @@ def main() -> int:
         return 2
 
     model = status.get("model", {})
+    gpu = status.get("gpu") or {}
     print(f"server up {status['uptime_s']:.0f} s, "
           f"{status['requests']} requests so far")
     print(f"  {model.get('net_type')} {model.get('precision')}, "
           f"cuda_graph={model.get('cuda_graph')}, crop={status.get('crop_size')}")
-    print(f"  frame out attached: {status.get('frame_out_attached')}")
+    print(f"  frame out attached: {status.get('frame_out_attached')}   "
+          f"ports configured: {status.get('ports_configured')}")
+    if gpu.get("available"):
+        print(f"  GPU {gpu['sm_mhz']} MHz / {gpu['mem_mhz']} MHz, "
+              f"clocks_locked={gpu['clocks_locked']}, "
+              f"throttle={gpu['throttle_reasons'] or 'none'}")
+        if not gpu["clocks_locked"]:
+            print("  WARNING: clocks idling - expect several times the latency")
     print()
 
     round_trips: list[float] = []
@@ -64,33 +71,32 @@ def main() -> int:
 
     for index in range(args.requests):
         started = time.perf_counter()
-        reading = client.heading(target_port=args.target_port,
-                                 max_age_ms=args.max_age_ms,
-                                 timeout_ms=500)
+        snap = client.snapshot(max_age_ms=args.max_age_ms, timeout_ms=500)
         measured = (time.perf_counter() - started) * 1000.0
         round_trips.append(measured)
 
-        if reading.ok:
+        if snap.ok:
             ok_count += 1
-            if reading.inference_ms is not None:
-                inference.append(reading.inference_ms)
-            if reading.frame_age_ms is not None:
-                ages.append(reading.frame_age_ms)
-            if reading.frame_id is not None:
-                frame_ids.append(reading.frame_id)
-            methods[reading.angle_correction_method or "?"] = \
-                methods.get(reading.angle_correction_method or "?", 0) + 1
+            if snap.inference_ms is not None:
+                inference.append(snap.inference_ms)
+            if snap.frame_age_ms is not None:
+                ages.append(snap.frame_age_ms)
+            if snap.frame_id is not None:
+                frame_ids.append(snap.frame_id)
+            method = snap.angle_correction_method or "?"
+            methods[method] = methods.get(method, 0) + 1
             if index < 5:
-                print(f"  bearing {reading.bearing:6.1f}d  "
-                      f"cue {reading.cue_angle:7.1f}d  "
-                      f"frame {reading.frame_id}  "
-                      f"age {reading.frame_age_ms:5.1f} ms  "
-                      f"infer {reading.inference_ms:5.1f} ms  "
-                      f"trip {measured:5.1f} ms")
+                ahead = snap.port_ahead(within=180)
+                print(f"  heading {snap.heading:6.1f}  "
+                      f"at ({snap.position[0]:4.0f},{snap.position[1]:4.0f})  "
+                      f"{snap.distance_from_centre:3.0f} px out  "
+                      f"ahead port {ahead} ({snap.angle_to(ahead):+6.1f})  "
+                      f"closest {snap.closest_port()}  "
+                      f"infer {snap.inference_ms:5.1f}  trip {measured:5.1f} ms")
         else:
-            reasons[reading.reason or "?"] = reasons.get(reading.reason or "?", 0) + 1
+            reasons[snap.reason or "?"] = reasons.get(snap.reason or "?", 0) + 1
             if index < 5:
-                print(f"  not ok: {reading.reason}  (trip {measured:.1f} ms)")
+                print(f"  not ok: {snap.reason}  (trip {measured:.1f} ms)")
 
         if args.interval:
             time.sleep(args.interval)
