@@ -541,10 +541,13 @@ The two older "Red rig" coordinate sets also exist in that function. They stay i
 analysis library for old data and do not need to come across unless a red rig is still
 running.
 
-Note the source comment calls these "placeholder values ... should be updated via
-calibration", but the off-by-one note shows they were since verified against DLC head
-position at port touch on every port of every new rig. Treat them as real, and
-re-verify with `calibrate_port_coordinates` if a camera is ever moved.
+The source comment calls these "placeholder values ... should be updated via
+calibration". They are not. Two independent checks say otherwise: the off-by-one note
+records them being verified against DLC head position at port touch on every port of
+every new rig, and drawing the rig 3 table over real footage puts every marker on its
+port fitting, in a hexagon of radius 466 px +/- 4% with spokes exactly 60 degrees apart,
+centred within 15 px of the frame centre. That is a calibration, not a guess. Treat them
+as real, and re-verify with `calibrate_port_coordinates` if a camera is ever moved.
 
 ---
 
@@ -667,10 +670,13 @@ Steps 1-7 are done. What is left needs a rig.
    it -- it needs a short test recording on a rig. Worth doing early, because the answer
    might be "retrain on 100 fps frames", which has a long lead time.
 10. **Verify each rig's port coordinates** by drawing them over a real frame from that
-    rig. `scripts/pose_warmup_check.py --ports` does this. Drawing rig 3's coordinates
-    over footage from another rig puts them visibly in the wrong place, which is exactly
-    the error that would otherwise show up months later as a systematic offset in the
-    analysis.
+    rig. `scripts/pose_warmup_check.py --ports` does this, and it takes one look.
+    Checked on the audiospatial footage, the rig 3 table lands squarely on the port
+    fittings and forms a clean hexagon - radius 466 px +/- 4%, spokes exactly 60 degrees
+    apart, centred within 15 px of the frame centre. So these are real calibration, not
+    the placeholders the source comment calls them. Worth re-checking per rig anyway,
+    because a nudged camera is silent: it shows up months later as a systematic offset
+    in the analysis and nowhere before that.
 
 Steps 9 and 10 are the two that could still change something. Everything else is
 finished and measured.
