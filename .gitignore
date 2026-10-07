@@ -432,3 +432,4 @@ FodyWeavers.xsd
 # Preview screenshots taken for review; delete whenever.
 /screenshots_temp
 benchmark_frames/
+reference_frames/
