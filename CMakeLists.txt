@@ -24,8 +24,8 @@ set(CMAKE_NO_SYSTEM_FROM_IMPORTED TRUE)
 # ============================================================================
 # DEPENDENCIES (vcpkg-managed)
 # ============================================================================
-find_package(OpenCV CONFIG REQUIRED COMPONENTS core imgproc)
 find_package(glfw3 CONFIG REQUIRED)
+find_package(imgui CONFIG REQUIRED)
 find_package(nlohmann_json CONFIG REQUIRED)
 find_package(OpenGL REQUIRED)
 
@@ -138,12 +138,12 @@ add_executable(behaviour_camera
     src/main.cpp
     src/config.cpp
     src/frame_sink.cpp
+    src/preview.cpp
 )
 target_link_libraries(behaviour_camera PRIVATE
     project_options
-    opencv_core
-    opencv_imgproc
     glfw
+    imgui::imgui
     nlohmann_json::nlohmann_json
     OpenGL::GL
     Spinnaker::Spinnaker

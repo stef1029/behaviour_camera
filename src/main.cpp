@@ -1,18 +1,19 @@
 // Standard library includes
+#include <atomic>
 #include <chrono>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <mutex>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
 
 // Third-party library includes
-#include <GLFW/glfw3.h>  // Must be included before any OpenGL headers
-#include <opencv2/core.hpp>
-#include <opencv2/imgproc.hpp>
 #include <nlohmann/json.hpp>
 
 // Spinnaker SDK includes
@@ -20,7 +21,9 @@
 #include <SpinGenApi/SpinnakerGenApi.h>
 
 #include "config.h"
+#include "frame_pipeline.h"
 #include "frame_sink.h"
+#include "preview.h"
 
 using namespace Spinnaker;
 using namespace Spinnaker::GenApi;
@@ -31,13 +34,19 @@ using json = nlohmann::json;
 namespace fs = std::filesystem;
 using behaviour_camera::Settings;
 using behaviour_camera::FrameSink;
+using behaviour_camera::Frame;
+using behaviour_camera::FramePool;
+using behaviour_camera::FrameQueue;
+using behaviour_camera::PreviewSlot;
+using behaviour_camera::Preview;
+using behaviour_camera::PreviewStatus;
+using behaviour_camera::ArenaGuide;
 
 namespace {
 
-// Returns a Spinnaker image to the driver however the scope is left, including by an
-// exception. A frame that is not released is never reused, so a handful of leaked
-// frames starves the camera - which used to be possible whenever the display path
-// threw partway through handling one.
+// Returns a Spinnaker image to the driver however the scope is left, including by
+// an exception. A frame that is not released is never reused, so a handful of
+// leaked frames starves the camera.
 class ScopedImage
 {
 public:
@@ -51,8 +60,7 @@ public:
             }
         }
         catch (Spinnaker::Exception&) {
-            // Nothing useful to do from a destructor, and throwing here would
-            // terminate the process.
+            // Nothing useful to do from a destructor, and throwing would terminate.
         }
     }
 
@@ -65,9 +73,9 @@ private:
     ImagePtr image_;
 };
 
-// Sends everything written to a stream to a second one as well, so console output is
-// also captured in a session log. Rig machines are launched without a console, where
-// otherwise every diagnostic message is lost precisely when it is wanted.
+// Sends everything written to a stream to a second one as well, so console output
+// is also captured in a session log. Rig machines are launched without a console,
+// where otherwise every diagnostic is lost precisely when it is wanted.
 class TeeBuffer : public std::streambuf
 {
 public:
@@ -80,6 +88,9 @@ protected:
         if (ch == traits_type::eof()) {
             return !traits_type::eof();
         }
+        // Two threads can log at once now, so serialise here rather than letting
+        // their characters interleave into unreadable output.
+        std::lock_guard<std::mutex> lock(mutex_);
         const int a = first_->sputc(static_cast<char>(ch));
         const int b = second_->sputc(static_cast<char>(ch));
         return (a == traits_type::eof() || b == traits_type::eof()) ? traits_type::eof() : ch;
@@ -87,18 +98,18 @@ protected:
 
     int sync() override
     {
+        std::lock_guard<std::mutex> lock(mutex_);
         const int a = first_->pubsync();
         const int b = second_->pubsync();
         return (a == 0 && b == 0) ? 0 : -1;
     }
 
 private:
+    std::mutex mutex_;
     std::streambuf* first_;
     std::streambuf* second_;
 };
 
-// Redirects cout and cerr into a log file as well as the console, and puts them back
-// when it goes out of scope.
 class SessionLog
 {
 public:
@@ -106,11 +117,9 @@ public:
     {
         file_.open(logPath, ios::out | ios::app);
         if (!file_.is_open()) {
-            cerr << "Warning: could not open the session log " << logPath
-                 << "; messages will only go to the console." << endl;
+            cerr << "Warning: could not open the session log " << logPath << endl;
             return;
         }
-
         outTee_ = make_unique<TeeBuffer>(cout.rdbuf(), file_.rdbuf());
         errTee_ = make_unique<TeeBuffer>(cerr.rdbuf(), file_.rdbuf());
         oldOut_ = cout.rdbuf(outTee_.get());
@@ -154,14 +163,10 @@ public:
                    const string& serial_number, const Settings& settings)
         : mouse_ID(mouse_ID), start_time(start_time), path(path),
           camSerial(serial_number), settings(settings), rig(settings.rig),
-          FPS(settings.fps), windowWidth(settings.window_width),
-          windowHeight(settings.window_height), frame_count(0)
+          FPS(settings.fps)
     {
         spinSystem = System::GetInstance();
         CameraList camList = spinSystem->GetCameras();
-
-        title = "Rig " + rig + ". Press 'Esc' to stop session.";
-
         pCam = camList.GetBySerial(camSerial);
         camList.Clear();
 
@@ -172,30 +177,24 @@ public:
 
         pCam->Init();
 
-        // Order matters here. Exposure and the stream buffers are set before the
-        // frame rate because the rate the camera will accept depends on them, and
-        // setCameraFrameRate clamps against what the camera reports at that moment.
+        // Exposure and the stream buffers go first because the frame rate the
+        // camera will accept depends on them, and setCameraFrameRate clamps
+        // against what the camera reports at that moment.
         setExposureTimeLowerLimit(settings.exposure_lower_limit_us);
         setStrobeLineToOutput(settings.strobe_line);
         setStreamBufferCount(settings.stream_buffers);
-
-        // Assigning the result back to this->FPS matters: the member is what gets
-        // written into the metadata and reused on recovery, so it has to hold the
-        // rate actually achieved rather than the one requested.
         FPS = setCameraFrameRate(settings.fps);
 
         INodeMap& nodeMap = pCam->GetNodeMap();
-
         CEnumerationPtr ptrAcquisitionMode = nodeMap.GetNode("AcquisitionMode");
         if (!IsReadable(ptrAcquisitionMode) || !IsWritable(ptrAcquisitionMode)) {
             throw runtime_error("Unable to set acquisition mode to continuous");
         }
-
-        CEnumEntryPtr ptrAcquisitionModeContinuous = ptrAcquisitionMode->GetEntryByName("Continuous");
-        if (!IsReadable(ptrAcquisitionModeContinuous)) {
+        CEnumEntryPtr ptrContinuous = ptrAcquisitionMode->GetEntryByName("Continuous");
+        if (!IsReadable(ptrContinuous)) {
             throw runtime_error("Unable to set acquisition mode to continuous");
         }
-        ptrAcquisitionMode->SetIntValue(ptrAcquisitionModeContinuous->GetValue());
+        ptrAcquisitionMode->SetIntValue(ptrContinuous->GetValue());
 
         pCam->BeginAcquisition();
         acquiring = true;
@@ -203,10 +202,9 @@ public:
         imageWidth = static_cast<size_t>(pCam->Width.GetValue());
         imageHeight = static_cast<size_t>(pCam->Height.GetValue());
         pixelFormat = string(pCam->PixelFormat.GetCurrentEntry()->GetSymbolic().c_str());
+        frameBytes = readPayloadSize();
 
         if (settings.recording_mode == "video") {
-            // The container extension is appended by the sink, since it comes from
-            // the encoder settings.
             const fs::path stem = fs::path(path) / (start_time + "_" + mouse_ID + "_video");
             sink = behaviour_camera::makeVideoSink(stem, settings.video,
                                                    static_cast<int>(imageWidth),
@@ -224,11 +222,13 @@ public:
              << imageWidth << "x" << imageHeight << " " << pixelFormat
              << " at " << FPS << " fps" << endl;
         cout << "Writing " << sink->describe() << endl;
+
+        checkDiskSpaceAtStart();
     }
 
     // Every Spinnaker call here can throw, and a destructor is implicitly noexcept:
-    // an escaping exception calls std::terminate, which showed up as the process
-    // dying with 0xC0000409 at the end of every otherwise successful session.
+    // an escaping exception calls std::terminate, which used to show up as the
+    // process dying with 0xC0000409 at the end of an otherwise good session.
     ~CameraRecorder()
     {
         try {
@@ -244,8 +244,7 @@ public:
             cerr << "Warning: error shutting the camera down: " << e.what() << endl;
         }
 
-        // The system instance must outlive every camera reference.
-        pCam = nullptr;
+        pCam = nullptr;   // must be gone before the system is released
 
         try {
             if (spinSystem) {
@@ -257,206 +256,175 @@ public:
         }
     }
 
-    // True if the session ran to a normal stop, false if it was cut short.
-    bool startRecording(bool show_frame, bool save_video)
+    bool startRecording(bool showPreview, bool saveVideo)
     {
-        frame_IDs.clear();
+        saveVideo_ = saveVideo;
         saveData();
 
-        bool completed = captureFrames(show_frame, save_video);
+        // One pool of preallocated buffers, sized from the configured ring. This
+        // is the slack that absorbs a disk stall: at 1.25 MiB a frame, a gigabyte
+        // is about 800 frames, which is nearly half a minute at 30 fps.
+        const size_t poolFrames = std::max<size_t>(
+            8, (static_cast<size_t>(settings.ring_buffer_mb) * 1024u * 1024u) / frameBytes);
+        pool = make_unique<FramePool>(frameBytes, poolFrames);
+        previewSlot = make_unique<PreviewSlot>(frameBytes);
 
-        // The whole analysis chain assumes output frame i is the i-th entry of
-        // frame_IDs. Checking it here, while the session is still in hand, is the
-        // difference between a known-bad recording and one that is discovered to be
-        // misaligned months later.
-        outputFrameCount = sink ? sink->frameCount() : -1;
-        if (outputFrameCount >= 0 &&
-            outputFrameCount != static_cast<int64_t>(frame_IDs_mem.size())) {
-            cerr << "Error: the output holds " << outputFrameCount << " frames but "
-                 << frame_IDs_mem.size() << " frame IDs were recorded. "
-                 << "They must match for frames to be mapped back to their timestamps."
-                 << endl;
-            abortReason = "output frame count does not match the number of frame IDs";
-            completed = false;
-        }
+        cout << "Ring buffer: " << poolFrames << " frames ("
+             << (poolFrames * frameBytes) / (1024 * 1024) << " MB, "
+             << (FPS > 0 ? poolFrames / FPS : 0.0) << " s of slack)" << endl;
 
-        end_time = currentDateTime();
-        completedNormally = completed;
-        saveData();
-
-        reportSummary();
-
-        // Written whatever the outcome, because the launcher waits for it and would
-        // otherwise hang forever on a failed session. The metadata records whether
-        // the session actually finished cleanly.
-        createSignalFile();
-        return completed;
-    }
-
-private:
-    string mouse_ID;
-    string start_time;
-    string end_time;
-    string path;
-    string camSerial;
-    Settings settings;
-    string rig;
-    double FPS;
-    int windowWidth;
-    int windowHeight;
-    size_t frame_count;
-
-    bool acquiring = false;
-    bool completedNormally = false;
-    string abortReason;
-
-    CameraPtr pCam;
-    SystemPtr spinSystem;
-
-    vector<uint64_t> frame_IDs;       // pending, flushed to the backup file in batches
-    vector<uint64_t> frame_IDs_mem;   // every ID, written into the metadata at the end
-    string title;
-    size_t imageWidth = 0;
-    size_t imageHeight = 0;
-    string pixelFormat;
-    unique_ptr<FrameSink> sink;
-
-    // Frames the camera produced that never reached us, counted from gaps in the
-    // camera's own frame counter. Recorded so a session says plainly whether it lost
-    // anything, rather than leaving it to be discovered during analysis.
-    int64_t droppedFrames = 0;
-    int64_t incompleteFrames = 0;
-    uint64_t lastFrameID = 0;
-    bool haveLastFrameID = false;
-
-    static constexpr size_t kFrameIdFlushInterval = 200;
-    static constexpr auto kStopSignalCheckInterval = milliseconds(250);
-    static constexpr auto kMetadataSaveInterval = seconds(30);
-
-    // A single incomplete frame is ordinary packet loss and is not worth reacting to:
-    // re-initialising the camera over one costs seconds of recording and resets the
-    // frame-ID counter. Only a sustained run of failures means something is actually
-    // wrong.
-    static constexpr int kConsecutiveFailuresBeforeRecovery = 10;
-    int consecutiveFailures = 0;
-
-    int recoveryAttempts = 0;
-    static constexpr int kMaxRecoveryAttempts = 3;
-    static constexpr auto kRecoveryCooldown = seconds(5);
-
-    bool captureFrames(bool show_frame, bool save_video)
-    {
         const fs::path frameIdPath =
             fs::path(path) / (start_time + "_" + mouse_ID + "_frame_ids_backup.txt");
-        ofstream frameIDFile(frameIdPath, ios_base::app);
-        if (!frameIDFile.is_open()) {
+        frameIdFile.open(frameIdPath, ios_base::app);
+        if (!frameIdFile.is_open()) {
             abortReason = "could not open the frame ID backup file";
             cerr << "Error: " << abortReason << endl;
             return false;
         }
 
-        GLFWwindow* window = nullptr;
-        if (show_frame) {
-            window = createWindow();
-            if (!window) {
-                abortReason = "could not create the preview window";
-                return false;
+        unique_ptr<Preview> preview;
+        if (showPreview) {
+            try {
+                ArenaGuide guide;
+                guide.enabled = settings.arena_guide;
+                preview = make_unique<Preview>(
+                    settings.window_width, settings.window_height,
+                    "Rig " + rig + " - " + mouse_ID,
+                    static_cast<int>(imageWidth), static_cast<int>(imageHeight), guide);
+            }
+            catch (const std::exception& e) {
+                // A missing display should not stop a recording; it is only the
+                // preview. Say so and carry on headless.
+                cerr << "Warning: no preview (" << e.what() << "). Recording anyway." << endl;
             }
         }
 
-        const auto displayInterval =
-            milliseconds(settings.display_fps > 0 ? 1000 / settings.display_fps : 33);
-        auto lastDisplay = steady_clock::now();
-        auto lastStopCheck = steady_clock::now();
-        auto lastMetadataSave = steady_clock::now();
+        sessionStart = steady_clock::now();
+        thread captureThread(&CameraRecorder::captureLoop, this);
+        thread writerThread(&CameraRecorder::writerLoop, this);
 
-        bool keepRunning = true;
-        bool completed = true;
+        displayLoop(preview.get());
 
-        while (keepRunning) {
+        // Stop in order: capture first so no new frames arrive, then let the
+        // writer drain what is already queued, so the last frames of a session
+        // are never thrown away.
+        stopRequested.store(true);
+        captureThread.join();
+        queue.close();
+        writerThread.join();
+
+        frameIdFile.close();
+
+        bool completed = !failed.load();
+        if (!sink->finish()) {
+            if (abortReason.empty()) {
+                abortReason = "the output could not be closed cleanly";
+            }
+            completed = false;
+        }
+
+        // The whole analysis chain assumes output frame i is the i-th entry of
+        // frame_IDs. Checking it here, while the session is still in hand, is the
+        // difference between a known-bad recording and one discovered to be
+        // misaligned months later.
+        outputFrameCount = sink->frameCount();
+        {
+            lock_guard<mutex> lock(frameIdMutex);
+            if (outputFrameCount >= 0 &&
+                outputFrameCount != static_cast<int64_t>(frameIDs.size())) {
+                cerr << "Error: the output holds " << outputFrameCount << " frames but "
+                     << frameIDs.size() << " frame IDs were recorded. They must match "
+                     << "for frames to be mapped back to their timestamps." << endl;
+                abortReason = "output frame count does not match the number of frame IDs";
+                completed = false;
+            }
+        }
+
+        end_time = currentDateTime();
+        completedNormally = completed;
+        saveData();
+        reportSummary();
+
+        // Written whatever the outcome, because the launcher waits for it and
+        // would otherwise hang forever. The metadata says whether it went well.
+        createSignalFile();
+        return completed;
+    }
+
+private:
+    // ---------------------------------------------------------------- threads
+
+    // Does as little as possible: grab, copy, hand the camera's buffer straight
+    // back, publish. Everything slower happens on another thread.
+    void captureLoop()
+    {
+        int consecutiveFailures = 0;
+
+        while (!stopRequested.load() && !failed.load()) {
             try {
                 ScopedImage frame(pCam->GetNextImage(1000));
 
                 if (!frame.get().IsValid() || frame.get()->IsIncomplete()) {
-                    ++incompleteFrames;
+                    counters.incompleteFrames.fetch_add(1);
                     ++consecutiveFailures;
 
+                    // One incomplete frame is ordinary packet loss. Re-initialising
+                    // the camera over it costs seconds of recording and resets the
+                    // frame-ID counter, so only a sustained run of failures counts
+                    // as something actually being wrong.
                     if (consecutiveFailures < kConsecutiveFailuresBeforeRecovery) {
-                        // Drop it and carry on; the next frame is usually fine.
                         continue;
                     }
-
                     cerr << consecutiveFailures << " consecutive bad frames; "
                          << "attempting camera recovery." << endl;
                     if (!attemptRecovery()) {
-                        abortReason = "camera could not be recovered";
-                        cerr << "Error: " << abortReason << ". Stopping recording." << endl;
-                        completed = false;
-                        break;
+                        fail("camera could not be recovered");
+                        return;
                     }
                     consecutiveFailures = 0;
                     continue;
                 }
 
                 consecutiveFailures = 0;
-                countDroppedFrames(frame.get()->GetFrameID());
+                const uint64_t frameID = frame.get()->GetFrameID();
+                countDroppedInTransit(frameID);
+                counters.framesCaptured.fetch_add(1);
 
-                if (save_video && !writeFrame(frame.get(), frameIDFile)) {
-                    abortReason = "failed to write image data to the binary file";
-                    cerr << "Error: " << abortReason << endl;
-                    completed = false;
-                    break;
+                const void* data = frame.get()->GetData();
+                const size_t size = frame.get()->GetImageSize();
+
+                if (previewSlot->wanted()) {
+                    previewSlot->publish(data, size, frameID);
                 }
 
-                const auto now = steady_clock::now();
-
-                if (show_frame && now - lastDisplay >= displayInterval) {
-                    drawPreview(window, frame.get());
-                    lastDisplay = now;
+                if (!saveVideo_) {
+                    continue;
                 }
 
-                // Pumped every iteration rather than only when a frame is drawn, so
-                // the window stays responsive and Esc is seen promptly.
-                if (show_frame) {
-                    glfwPollEvents();
-                    if (glfwGetKey(window, GLFW_KEY_ESCAPE) == GLFW_PRESS ||
-                        glfwWindowShouldClose(window)) {
-                        cout << "Stop requested from the preview window." << endl;
-                        keepRunning = false;
-                    }
+                Frame* buffer = pool->acquire();
+                if (buffer == nullptr) {
+                    // Every buffer is in flight, so the writer is behind. Dropping
+                    // deliberately and counting it is better than blocking here,
+                    // which would stall the camera and lose frames anyway - only
+                    // silently, at the driver.
+                    counters.droppedNoBuffer.fetch_add(1);
+                    continue;
                 }
 
-                // On a wall-clock timer, and outside the preview branch. It used to
-                // be inside it and gated on a frame counter, so with the preview off
-                // there was no way to stop the recorder at all.
-                if (now - lastStopCheck >= kStopSignalCheckInterval) {
-                    lastStopCheck = now;
-                    if (stopSignalPresent()) {
-                        cout << "Stop signal file found." << endl;
-                        keepRunning = false;
-                    }
-                }
-
-                // Keeps the metadata usable if the machine dies mid-session.
-                if (now - lastMetadataSave >= kMetadataSaveInterval) {
-                    lastMetadataSave = now;
-                    saveData();
-                }
-
-                ++frame_count;
+                std::memcpy(buffer->data.data(), data, size);
+                buffer->size = size;
+                buffer->frameID = frameID;
+                queue.push(buffer);
             }
             catch (Spinnaker::Exception& e) {
                 ++consecutiveFailures;
                 cerr << "Camera error: " << e.what() << endl;
-
                 if (consecutiveFailures < kConsecutiveFailuresBeforeRecovery) {
                     continue;
                 }
                 if (!attemptRecovery()) {
-                    abortReason = string("unrecoverable camera error: ") + e.what();
-                    cerr << "Error: stopping recording." << endl;
-                    completed = false;
-                    break;
+                    fail(string("unrecoverable camera error: ") + e.what());
+                    return;
                 }
                 consecutiveFailures = 0;
             }
@@ -471,97 +439,266 @@ private:
             }
             acquiring = false;
         }
+    }
 
-        flushFrameIds(frameIDFile);
-        frameIDFile.close();
-
-        // Closing the sink is what makes an encoder flush and finalise its
-        // container, so a failure here means the output is not trustworthy even if
-        // every frame was handed over successfully.
-        if (!sink->finish()) {
-            if (abortReason.empty()) {
-                abortReason = "the output could not be closed cleanly";
+    // Owns the output and the frame-ID record. Frames appear in frame_IDs only
+    // once written, and in write order, which is what keeps output frame i and
+    // frame_IDs[i] the same thing even when frames have been dropped.
+    void writerLoop()
+    {
+        while (Frame* frame = queue.pop()) {
+            if (!sink->write(frame->data.data(), frame->size)) {
+                pool->release(frame);
+                fail("failed to write image data");
+                return;
             }
-            completed = false;
+
+            counters.framesWritten.fetch_add(1);
+            counters.bytesWritten.fetch_add(static_cast<int64_t>(frame->size));
+
+            {
+                lock_guard<mutex> lock(frameIdMutex);
+                frameIDs.push_back(frame->frameID);
+                pendingFrameIds.push_back(frame->frameID);
+                if (pendingFrameIds.size() >= kFrameIdFlushInterval) {
+                    flushFrameIdsLocked();
+                }
+            }
+
+            pool->release(frame);
         }
 
-        if (window) {
-            glfwDestroyWindow(window);
-            glfwTerminate();
-        }
-
-        return completed;
+        lock_guard<mutex> lock(frameIdMutex);
+        flushFrameIdsLocked();
     }
 
-    GLFWwindow* createWindow()
+    // Runs on the main thread, because that is where the window belongs on
+    // Windows, and because keeping it out of the capture loop is what stops the
+    // window freezing exactly when the camera is in trouble.
+    void displayLoop(Preview* preview)
     {
-        if (!glfwInit()) {
-            cerr << "Error: failed to initialise GLFW" << endl;
-            return nullptr;
-        }
+        const auto displayInterval =
+            milliseconds(settings.display_fps > 0 ? 1000 / settings.display_fps : 33);
 
-        GLFWwindow* window = glfwCreateWindow(windowWidth, windowHeight, title.c_str(), nullptr, nullptr);
-        if (!window) {
-            cerr << "Error: failed to create the preview window" << endl;
-            glfwTerminate();
-            return nullptr;
-        }
+        auto lastStopCheck = steady_clock::now();
+        auto lastMetadataSave = steady_clock::now();
+        auto lastDiskCheck = steady_clock::now();
+        auto lastRateSample = steady_clock::now();
+        int64_t lastFrameCount = 0;
+        int64_t lastByteCount = 0;
 
-        glfwMakeContextCurrent(window);
-        glViewport(0, 0, windowWidth, windowHeight);
-        glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
-        return window;
+        vector<uint8_t> image;
+        uint64_t previewFrameID = 0;
+
+        while (!stopRequested.load() && !failed.load()) {
+            const auto now = steady_clock::now();
+
+            if (now - lastRateSample >= milliseconds(500)) {
+                const double seconds = duration<double>(now - lastRateSample).count();
+                const int64_t frames = counters.framesCaptured.load();
+                const int64_t bytes = counters.bytesWritten.load();
+                measuredFps = (frames - lastFrameCount) / seconds;
+                writeRateMBs = (bytes - lastByteCount) / seconds / 1e6;
+                lastFrameCount = frames;
+                lastByteCount = bytes;
+                lastRateSample = now;
+                readCameraHealth();
+            }
+
+            if (preview != nullptr) {
+                previewSlot->request();
+                previewSlot->take(image, previewFrameID);
+                preview->render(image, buildStatus());
+                if (preview->stopRequested()) {
+                    cout << "Stop requested from the preview window." << endl;
+                    break;
+                }
+            }
+
+            // On a wall-clock timer, and outside the preview branch: with the
+            // preview off there used to be no way to stop the recorder at all.
+            if (now - lastStopCheck >= kStopSignalCheckInterval) {
+                lastStopCheck = now;
+                if (stopSignalPresent()) {
+                    cout << "Stop signal file found." << endl;
+                    break;
+                }
+            }
+
+            if (now - lastMetadataSave >= kMetadataSaveInterval) {
+                lastMetadataSave = now;
+                saveData();
+            }
+
+            if (now - lastDiskCheck >= kDiskCheckInterval) {
+                lastDiskCheck = now;
+                if (!diskSpaceStillSufficient()) {
+                    break;
+                }
+            }
+
+            if (preview == nullptr) {
+                // Nothing to draw, so there is no reason to spin.
+                std::this_thread::sleep_for(milliseconds(50));
+            } else {
+                std::this_thread::sleep_for(displayInterval);
+            }
+        }
     }
 
-    void drawPreview(GLFWwindow* window, const ImagePtr& image)
+    // ---------------------------------------------------------------- helpers
+
+    // Read occasionally rather than every frame: these are slow register reads
+    // over the link, and nobody needs the camera's temperature at 30 Hz.
+    void readCameraHealth()
     {
-        cv::Mat source(cv::Size(static_cast<int>(imageWidth), static_cast<int>(imageHeight)),
-                       CV_8UC1, image->GetData(), image->GetStride());
-
-        cv::Mat resized;
-        cv::resize(source, resized, cv::Size(windowWidth, windowHeight));
-
-        glClear(GL_COLOR_BUFFER_BIT);
-        glPixelZoom(1.0f, -1.0f);
-        glRasterPos2i(-1, 1);
-        glDrawPixels(resized.cols, resized.rows, GL_LUMINANCE, GL_UNSIGNED_BYTE, resized.data);
-        glfwSwapBuffers(window);
+        try {
+            INodeMap& nodeMap = pCam->GetNodeMap();
+            CFloatPtr exposure = nodeMap.GetNode("ExposureTime");
+            if (IsReadable(exposure)) {
+                lastExposure = exposure->GetValue();
+            }
+            CFloatPtr temperature = nodeMap.GetNode("DeviceTemperature");
+            if (IsReadable(temperature)) {
+                lastTemperature = temperature->GetValue();
+            }
+        }
+        catch (Spinnaker::Exception&) {
+            // Health readings are a nicety; losing them is not worth a fuss.
+        }
     }
 
-    bool writeFrame(const ImagePtr& image, ofstream& frameIDFile)
+    PreviewStatus buildStatus() const
     {
-        if (!sink->write(image->GetData(), image->GetImageSize())) {
-            return false;
+        PreviewStatus status;
+        status.rig = rig;
+        status.mouseID = mouse_ID;
+        status.sinkDescription = sink->describe();
+        status.pixelFormat = pixelFormat;
+        status.imageWidth = static_cast<int>(imageWidth);
+        status.imageHeight = static_cast<int>(imageHeight);
+        status.targetFps = FPS;
+        status.measuredFps = measuredFps;
+        status.elapsedSeconds = duration<double>(steady_clock::now() - sessionStart).count();
+        status.writeMegabytesPerSecond = writeRateMBs;
+
+        status.framesWritten = counters.framesWritten.load();
+        status.droppedInTransit = counters.droppedInTransit.load();
+        status.droppedNoBuffer = counters.droppedNoBuffer.load();
+        status.incompleteFrames = counters.incompleteFrames.load();
+        status.cameraResets = counters.cameraResets.load();
+
+        status.bufferDepth = queue.depth();
+        status.bufferCapacity = pool->capacity();
+        status.bufferHighWater = queue.highWater();
+
+        error_code error;
+        const auto space = fs::space(path, error);
+        if (!error) {
+            status.diskFreeGigabytes = space.available / 1e9;
+            if (writeRateMBs > 0.1) {
+                status.diskSecondsRemaining = (space.available / 1e6) / writeRateMBs;
+            }
         }
 
-        const uint64_t frameID = image->GetFrameID();
-        frame_IDs.push_back(frameID);
-        frame_IDs_mem.push_back(frameID);
-
-        if (frame_IDs.size() >= kFrameIdFlushInterval) {
-            flushFrameIds(frameIDFile);
-        }
-        return true;
+        status.exposureMicroseconds = lastExposure;
+        status.temperatureCelsius = lastTemperature;
+        return status;
     }
 
-    void flushFrameIds(ofstream& frameIDFile)
+    size_t readPayloadSize() const
     {
-        if (frame_IDs.empty()) {
+        INodeMap& nodeMap = pCam->GetNodeMap();
+        CIntegerPtr payload = nodeMap.GetNode("PayloadSize");
+        if (IsReadable(payload)) {
+            return static_cast<size_t>(payload->GetValue());
+        }
+        // Mono8 fallback; only reached if the camera will not report its own
+        // payload size, in which case this is the best guess available.
+        return imageWidth * imageHeight;
+    }
+
+    void checkDiskSpaceAtStart()
+    {
+        error_code error;
+        const auto space = fs::space(path, error);
+        if (error) {
             return;
         }
-        for (const uint64_t id : frame_IDs) {
-            frameIDFile << id << '\n';
+
+        const double bytesPerSecond = estimatedBytesPerSecond();
+        if (bytesPerSecond <= 0) {
+            return;
         }
-        frameIDFile.flush();
-        frame_IDs.clear();
+        const double hours = space.available / bytesPerSecond / 3600.0;
+        cout << "Disk: " << space.available / 1e9 << " GB free, roughly "
+             << hours << " hours at this rate" << endl;
+        if (hours < 0.5) {
+            cerr << "Warning: less than 30 minutes of space on the capture drive." << endl;
+        }
     }
 
-    // The camera's frame counter increments for every frame it produces, including
-    // ones lost in transfer, so a gap is a dropped frame.
-    void countDroppedFrames(uint64_t frameID)
+    // Raw writes every byte; encoded output is far smaller, and this only feeds
+    // the headroom warning, so a conservative guess is fine.
+    double estimatedBytesPerSecond() const
+    {
+        const double raw = static_cast<double>(frameBytes) * FPS;
+        return settings.recording_mode == "video" ? raw / 20.0 : raw;
+    }
+
+    // Stops gracefully while the output can still be finalised, rather than dying
+    // with a write error partway through a trial.
+    bool diskSpaceStillSufficient()
+    {
+        error_code error;
+        const auto space = fs::space(path, error);
+        if (error) {
+            return true;
+        }
+        if (space.available > kDiskFloorBytes) {
+            return true;
+        }
+        cerr << "Error: only " << space.available / 1e6
+             << " MB left on the capture drive; stopping while the recording can "
+             << "still be closed cleanly." << endl;
+        {
+            lock_guard<mutex> lock(reasonMutex);
+            if (abortReason.empty()) {
+                abortReason = "ran out of disk space";
+            }
+        }
+        failed.store(true);
+        return false;
+    }
+
+    void fail(const string& reason)
+    {
+        {
+            lock_guard<mutex> lock(reasonMutex);
+            if (abortReason.empty()) {
+                abortReason = reason;
+            }
+        }
+        failed.store(true);
+        cerr << "Error: " << reason << ". Stopping recording." << endl;
+    }
+
+    void flushFrameIdsLocked()
+    {
+        for (const uint64_t id : pendingFrameIds) {
+            frameIdFile << id << '\n';
+        }
+        frameIdFile.flush();
+        pendingFrameIds.clear();
+    }
+
+    // The camera's counter increments for every frame it produces, including ones
+    // lost in transfer, so a gap means a frame never reached us.
+    void countDroppedInTransit(uint64_t frameID)
     {
         if (haveLastFrameID && frameID > lastFrameID + 1) {
-            droppedFrames += static_cast<int64_t>(frameID - lastFrameID - 1);
+            counters.droppedInTransit.fetch_add(
+                static_cast<int64_t>(frameID - lastFrameID - 1));
         }
         lastFrameID = frameID;
         haveLastFrameID = true;
@@ -584,8 +721,9 @@ private:
             }
             std::this_thread::sleep_for(milliseconds(500));
 
-            // This resets the camera's frame-ID counter, so IDs after a recovery are
-            // no longer a continuous index. The metadata records that it happened.
+            // This resets the camera's frame-ID counter, so IDs after a recovery
+            // are no longer a continuous index. The metadata records that it
+            // happened so the discontinuity is not a surprise later.
             pCam->DeInit();
             std::this_thread::sleep_for(milliseconds(500));
 
@@ -597,7 +735,7 @@ private:
 
             pCam->BeginAcquisition();
             acquiring = true;
-            ++cameraResets;
+            counters.cameraResets.fetch_add(1);
             haveLastFrameID = false;   // the counter restarted; do not count the jump
 
             ScopedImage test(pCam->GetNextImage(1000));
@@ -624,16 +762,20 @@ private:
         return fs::exists(fs::path(path) / ("stop_camera_" + rig + ".signal"), error);
     }
 
-    void reportSummary() const
+    void reportSummary()
     {
+        lock_guard<mutex> lock(frameIdMutex);
         cout << "\nSession summary\n"
-             << "  frames recorded   " << frame_IDs_mem.size() << "\n"
-             << "  dropped in transit " << droppedFrames << "\n"
-             << "  incomplete frames " << incompleteFrames << "\n"
-             << "  camera resets     " << cameraResets << "\n"
-             << "  finished normally " << (completedNormally ? "yes" : "no") << endl;
+             << "  frames recorded        " << frameIDs.size() << "\n"
+             << "  dropped in transit     " << counters.droppedInTransit.load() << "\n"
+             << "  dropped, writer behind " << counters.droppedNoBuffer.load() << "\n"
+             << "  incomplete frames      " << counters.incompleteFrames.load() << "\n"
+             << "  camera resets          " << counters.cameraResets.load() << "\n"
+             << "  ring buffer peak       " << queue.highWater() << " of "
+             << (pool ? pool->capacity() : 0) << "\n"
+             << "  finished normally      " << (completedNormally ? "yes" : "no") << endl;
         if (!completedNormally && !abortReason.empty()) {
-            cout << "  stopped because   " << abortReason << endl;
+            cout << "  stopped because        " << abortReason << endl;
         }
     }
 
@@ -646,18 +788,26 @@ private:
         data["image_height"] = imageHeight;
         data["image_width"] = imageWidth;
         data["pixel_format"] = pixelFormat;
-        data["frame_IDs"] = frame_IDs_mem;
+        {
+            lock_guard<mutex> lock(frameIdMutex);
+            data["frame_IDs"] = frameIDs;
+        }
 
-        // Added alongside the original fields rather than replacing any, so existing
-        // analysis code reads this file exactly as before.
+        // Added alongside the original fields rather than replacing any, so
+        // existing analysis code reads this file exactly as before.
         data["serial_number"] = camSerial;
         data["rig"] = rig;
-        data["dropped_frames"] = droppedFrames;
-        data["incomplete_frames"] = incompleteFrames;
-        data["camera_resets"] = cameraResets;
+        data["dropped_frames"] = counters.droppedInTransit.load();
+        data["dropped_no_buffer"] = counters.droppedNoBuffer.load();
+        data["incomplete_frames"] = counters.incompleteFrames.load();
+        data["camera_resets"] = counters.cameraResets.load();
+        data["ring_buffer_peak"] = queue.highWater();
         data["completed_normally"] = completedNormally;
-        if (!abortReason.empty()) {
-            data["abort_reason"] = abortReason;
+        {
+            lock_guard<mutex> lock(reasonMutex);
+            if (!abortReason.empty()) {
+                data["abort_reason"] = abortReason;
+            }
         }
         data["recording_mode"] = settings.recording_mode;
         if (sink) {
@@ -673,7 +823,6 @@ private:
         const fs::path finalPath =
             fs::path(path) / (start_time + "_" + mouse_ID + "_Tracker_data.json");
         const fs::path tempPath = finalPath.string() + ".tmp";
-
         {
             ofstream file(tempPath);
             if (!file) {
@@ -682,83 +831,68 @@ private:
             }
             file << data.dump(4);
         }
-
         error_code error;
         fs::rename(tempPath, finalPath, error);
         if (error) {
-            cerr << "Warning: could not replace " << finalPath << ": " << error.message() << endl;
+            cerr << "Warning: could not replace " << finalPath << ": "
+                 << error.message() << endl;
         }
     }
 
     double setCameraFrameRate(double frameRate)
     {
         INodeMap& nodeMap = pCam->GetNodeMap();
-
-        CBooleanPtr ptrFrameRateEnable = nodeMap.GetNode("AcquisitionFrameRateEnable");
-        if (IsWritable(ptrFrameRateEnable)) {
-            ptrFrameRateEnable->SetValue(true);
+        CBooleanPtr ptrEnable = nodeMap.GetNode("AcquisitionFrameRateEnable");
+        if (IsWritable(ptrEnable)) {
+            ptrEnable->SetValue(true);
         }
 
-        CFloatPtr ptrFrameRate = nodeMap.GetNode("AcquisitionFrameRate");
-        if (!IsWritable(ptrFrameRate)) {
+        CFloatPtr ptrRate = nodeMap.GetNode("AcquisitionFrameRate");
+        if (!IsWritable(ptrRate)) {
             throw runtime_error("Unable to set the frame rate on this camera");
         }
 
         // The achievable range depends on pixel format, ROI and exposure, so it is
-        // read from the device rather than kept in a table that needs maintaining.
-        const double minRate = ptrFrameRate->GetMin();
-        const double maxRate = ptrFrameRate->GetMax();
+        // read from the device rather than kept in a table needing maintenance.
+        const double lo = ptrRate->GetMin();
+        const double hi = ptrRate->GetMax();
         double applied = frameRate;
-        if (applied < minRate) applied = minRate;
-        if (applied > maxRate) applied = maxRate;
-
+        if (applied < lo) applied = lo;
+        if (applied > hi) applied = hi;
         if (applied != frameRate) {
-            cout << "Requested " << frameRate << " fps; this camera allows " << minRate
-                 << " to " << maxRate << ", so recording at " << applied << " fps." << endl;
+            cout << "Requested " << frameRate << " fps; this camera allows " << lo
+                 << " to " << hi << ", so recording at " << applied << " fps." << endl;
         }
-
-        ptrFrameRate->SetValue(applied);
-        return ptrFrameRate->GetValue();   // the camera quantises it
+        ptrRate->SetValue(applied);
+        return ptrRate->GetValue();   // the camera quantises it
     }
 
-    // Decides how many frames the driver may hold while we are busy writing. The
-    // camera default is 10, about a third of a second at 30 fps, which is why an
-    // ordinary disk stall used to cost frames.
     void setStreamBufferCount(int count)
     {
         if (count <= 0) {
             return;
         }
+        INodeMap& stream = pCam->GetTLStreamNodeMap();
 
-        INodeMap& streamNodeMap = pCam->GetTLStreamNodeMap();
-
-        CEnumerationPtr ptrBufferCountMode = streamNodeMap.GetNode("StreamBufferCountMode");
-        if (IsWritable(ptrBufferCountMode)) {
-            CEnumEntryPtr manual = ptrBufferCountMode->GetEntryByName("Manual");
+        CEnumerationPtr ptrMode = stream.GetNode("StreamBufferCountMode");
+        if (IsWritable(ptrMode)) {
+            CEnumEntryPtr manual = ptrMode->GetEntryByName("Manual");
             if (IsReadable(manual)) {
-                ptrBufferCountMode->SetIntValue(manual->GetValue());
+                ptrMode->SetIntValue(manual->GetValue());
             }
         }
 
-        CIntegerPtr ptrBufferCount = streamNodeMap.GetNode("StreamBufferCountManual");
-        if (!IsWritable(ptrBufferCount)) {
-            cerr << "Warning: this camera will not let the buffer count be set; "
-                 << "leaving it at the default." << endl;
+        CIntegerPtr ptrCount = stream.GetNode("StreamBufferCountManual");
+        if (!IsWritable(ptrCount)) {
+            cerr << "Warning: this camera will not let the buffer count be set." << endl;
             return;
         }
+        const int64_t clamped = std::min(std::max<int64_t>(count, ptrCount->GetMin()),
+                                         ptrCount->GetMax());
+        ptrCount->SetValue(clamped);
 
-        const int64_t requested = count;
-        const int64_t clamped = std::min(std::max(requested, ptrBufferCount->GetMin()),
-                                         ptrBufferCount->GetMax());
-        ptrBufferCount->SetValue(clamped);
-
-        if (clamped != requested) {
-            cout << "Stream buffers: asked for " << requested << ", camera allows up to "
-                 << ptrBufferCount->GetMax() << ", using " << clamped << "." << endl;
-        }
-
-        CIntegerPtr ptrBufferResult = streamNodeMap.GetNode("StreamBufferCountResult");
-        const int64_t inUse = IsReadable(ptrBufferResult) ? ptrBufferResult->GetValue() : clamped;
+        CIntegerPtr ptrResult = stream.GetNode("StreamBufferCountResult");
+        const int64_t inUse = IsReadable(ptrResult) ? ptrResult->GetValue() : clamped;
         cout << "Stream buffers: " << inUse << " ("
              << (FPS > 0 ? inUse / FPS : 0.0) << " s of slack at the current rate)" << endl;
     }
@@ -768,15 +902,15 @@ private:
         INodeMap& nodeMap = pCam->GetNodeMap();
         const string lineName = "Line" + to_string(lineNumber);
 
-        CEnumerationPtr ptrLineSelector = nodeMap.GetNode("LineSelector");
-        if (!IsWritable(ptrLineSelector)) {
+        CEnumerationPtr ptrSelector = nodeMap.GetNode("LineSelector");
+        if (!IsWritable(ptrSelector)) {
             throw runtime_error("Unable to access LineSelector");
         }
-        CEnumEntryPtr ptrLine = ptrLineSelector->GetEntryByName(lineName.c_str());
+        CEnumEntryPtr ptrLine = ptrSelector->GetEntryByName(lineName.c_str());
         if (!IsReadable(ptrLine)) {
             throw runtime_error("Camera has no " + lineName + " to use as the frame strobe");
         }
-        ptrLineSelector->SetIntValue(ptrLine->GetValue());
+        ptrSelector->SetIntValue(ptrLine->GetValue());
 
         CEnumerationPtr ptrLineMode = nodeMap.GetNode("LineMode");
         if (!IsWritable(ptrLineMode)) {
@@ -789,41 +923,98 @@ private:
         ptrLineMode->SetIntValue(ptrOutput->GetValue());
     }
 
-    void setExposureTimeLowerLimit(double exposureTimeLowerLimit)
+    void setExposureTimeLowerLimit(double limit)
     {
         INodeMap& nodeMap = pCam->GetNodeMap();
 
-        CEnumerationPtr ptrExposureAuto = nodeMap.GetNode("ExposureAuto");
-        if (!IsWritable(ptrExposureAuto)) {
+        CEnumerationPtr ptrAuto = nodeMap.GetNode("ExposureAuto");
+        if (!IsWritable(ptrAuto)) {
             throw runtime_error("Unable to access ExposureAuto");
         }
-        CEnumEntryPtr ptrContinuous = ptrExposureAuto->GetEntryByName("Continuous");
+        CEnumEntryPtr ptrContinuous = ptrAuto->GetEntryByName("Continuous");
         if (!IsReadable(ptrContinuous)) {
             throw runtime_error("Unable to set ExposureAuto to Continuous");
         }
-        ptrExposureAuto->SetIntValue(ptrContinuous->GetValue());
+        ptrAuto->SetIntValue(ptrContinuous->GetValue());
 
-        CFloatPtr ptrLowerLimit = nodeMap.GetNode("AutoExposureExposureTimeLowerLimit");
-        if (!IsReadable(ptrLowerLimit) || !IsWritable(ptrLowerLimit)) {
+        CFloatPtr ptrLimit = nodeMap.GetNode("AutoExposureExposureTimeLowerLimit");
+        if (!IsReadable(ptrLimit) || !IsWritable(ptrLimit)) {
             throw runtime_error("Unable to access AutoExposureExposureTimeLowerLimit");
         }
-
-        const double lowest = ptrLowerLimit->GetMin();
-        const double highest = ptrLowerLimit->GetMax();
-        double applied = exposureTimeLowerLimit;
-        if (applied < lowest) applied = lowest;
-        if (applied > highest) applied = highest;
-        ptrLowerLimit->SetValue(applied);
+        const double lo = ptrLimit->GetMin();
+        const double hi = ptrLimit->GetMax();
+        double applied = limit;
+        if (applied < lo) applied = lo;
+        if (applied > hi) applied = hi;
+        ptrLimit->SetValue(applied);
     }
 
     void createSignalFile() const
     {
-        const fs::path signalFile = fs::path(path) / ("rig_" + rig + "_camera_finished.signal");
+        const fs::path signalFile =
+            fs::path(path) / ("rig_" + rig + "_camera_finished.signal");
         ofstream file(signalFile);
     }
 
-    int cameraResets = 0;
+    // ---------------------------------------------------------------- state
+
+    string mouse_ID;
+    string start_time;
+    string end_time;
+    string path;
+    string camSerial;
+    Settings settings;
+    string rig;
+    double FPS;
+
+    CameraPtr pCam;
+    SystemPtr spinSystem;
+    bool acquiring = false;
+    bool saveVideo_ = true;
+
+    size_t imageWidth = 0;
+    size_t imageHeight = 0;
+    size_t frameBytes = 0;
+    string pixelFormat;
+
+    unique_ptr<FrameSink> sink;
+    unique_ptr<FramePool> pool;
+    unique_ptr<PreviewSlot> previewSlot;
+    FrameQueue queue;
+    behaviour_camera::Counters counters;
+
+    atomic<bool> stopRequested{ false };
+    atomic<bool> failed{ false };
+    mutable mutex reasonMutex;
+    string abortReason;
+    bool completedNormally = false;
     int64_t outputFrameCount = -1;
+
+    // frameIDs is the record that must match the output exactly, so only the
+    // writer appends to it and everything else reads it under this mutex.
+    mutable mutex frameIdMutex;
+    vector<uint64_t> frameIDs;
+    vector<uint64_t> pendingFrameIds;
+    ofstream frameIdFile;
+
+    uint64_t lastFrameID = 0;
+    bool haveLastFrameID = false;
+    int recoveryAttempts = 0;
+
+    steady_clock::time_point sessionStart;
+    double measuredFps = 0.0;
+    double writeRateMBs = 0.0;
+    double lastExposure = -1.0;
+    double lastTemperature = -1000.0;
+
+    static constexpr size_t kFrameIdFlushInterval = 200;
+    static constexpr auto kStopSignalCheckInterval = milliseconds(250);
+    static constexpr auto kMetadataSaveInterval = seconds(30);
+    static constexpr auto kDiskCheckInterval = seconds(10);
+    static constexpr int kConsecutiveFailuresBeforeRecovery = 10;
+    static constexpr int kMaxRecoveryAttempts = 3;
+    static constexpr auto kRecoveryCooldown = seconds(5);
+    static constexpr uint64_t kDiskFloorBytes = 2ull * 1024 * 1024 * 1024;
 };
 
 namespace {
@@ -854,10 +1045,12 @@ void printUsage()
         "  --mode raw|video       .bin of raw frames, or GPU-encoded video\n"
         "  --qp <n>               encoder quality, lower is better (video mode)\n"
         "  --gop <n>              frames between keyframes (video mode)\n"
+        "  --ring-buffer-mb <n>   RAM held between capture and writing\n"
         "\n"
         "Preview\n"
         "  --windowWidth <px>     preview width\n"
         "  --windowHeight <px>    preview height\n"
+        "  --arena-guide          draw the arena alignment guide\n"
         "  --no-preview           record without a preview window\n"
         "\n"
         "  --help                 this message\n"
@@ -881,15 +1074,15 @@ struct Arguments
     optional<int> strobeLine;
     optional<int> qp;
     optional<int> gop;
+    optional<int> ringBufferMb;
     optional<int> windowWidth;
     optional<int> windowHeight;
     bool showPreview = true;
+    bool arenaGuide = false;
 };
 
-// Returns false if the program should stop: either --help, or an argument that could
-// not be understood. Unknown arguments are rejected rather than ignored, because the
-// old parser stepped two at a time and silently mis-read everything after a flag that
-// had no value.
+// Returns false if the program should stop: either --help, or an argument that
+// could not be understood. Unknown arguments are rejected rather than ignored.
 bool parseArguments(int argc, char** argv, Arguments& args, int& exitCode)
 {
     for (int i = 1; i < argc; ++i) {
@@ -902,6 +1095,10 @@ bool parseArguments(int argc, char** argv, Arguments& args, int& exitCode)
         }
         if (arg == "--no-preview") {
             args.showPreview = false;
+            continue;
+        }
+        if (arg == "--arena-guide") {
+            args.arenaGuide = true;
             continue;
         }
 
@@ -925,6 +1122,7 @@ bool parseArguments(int argc, char** argv, Arguments& args, int& exitCode)
             else if (arg == "--strobe-line") args.strobeLine = stoi(value);
             else if (arg == "--qp") args.qp = stoi(value);
             else if (arg == "--gop") args.gop = stoi(value);
+            else if (arg == "--ring-buffer-mb") args.ringBufferMb = stoi(value);
             else if (arg == "--windowWidth") args.windowWidth = stoi(value);
             else if (arg == "--windowHeight") args.windowHeight = stoi(value);
             else {
@@ -935,8 +1133,6 @@ bool parseArguments(int argc, char** argv, Arguments& args, int& exitCode)
             }
         }
         catch (const std::exception&) {
-            // stod/stoi throw on anything non-numeric; this used to escape main and
-            // surface as an unhandled exception.
             cerr << "Error: " << arg << " expects a number, got '" << value << "'\n";
             exitCode = 2;
             return false;
@@ -975,8 +1171,7 @@ int main(int argc, char** argv)
     // The rig name matters more than it looks: the launcher watches for
     // rig_<name>_camera_finished.signal and writes stop_camera_<name>.signal, and
     // it knows the name from its own configuration. Taking it from the launcher
-    // means the two cannot disagree. Falling back to the serial keeps a bench
-    // camera working with no arguments at all.
+    // means the two cannot disagree.
     settings.rig = args.rig.empty() ? ("cam_" + args.serial_number) : args.rig;
 
     if (!args.mode.empty())   settings.recording_mode = args.mode;
@@ -986,17 +1181,16 @@ int main(int argc, char** argv)
     if (args.strobeLine)      settings.strobe_line = *args.strobeLine;
     if (args.qp)              settings.video.qp = *args.qp;
     if (args.gop)             settings.video.gop = *args.gop;
+    if (args.ringBufferMb)    settings.ring_buffer_mb = *args.ringBufferMb;
     if (args.windowWidth)     settings.window_width = *args.windowWidth;
     if (args.windowHeight)    settings.window_height = *args.windowHeight;
+    settings.arena_guide = args.arenaGuide;
 
     string path = args.path;
     if (path.empty()) {
         path = (fs::path(settings.output_root) / (args.date_time + "_" + args.mouse_ID)).string();
     }
 
-    // Created whichever way the path was arrived at. A path given with --path used to
-    // be left alone, so the only sign that it did not exist was the binary file
-    // failing to open several steps later.
     try {
         fs::create_directories(path);
     }
@@ -1010,15 +1204,13 @@ int main(int argc, char** argv)
         return 2;
     }
 
-    // From here on, everything printed also lands in the session folder, which is the
-    // only record of what happened on a rig launched without a console.
+    // From here on, everything printed also lands in the session folder, which is
+    // the only record of what happened on a rig launched without a console.
     SessionLog log(fs::path(path) / (args.date_time + "_" + args.mouse_ID + "_camera_log.txt"));
 
     try {
         CameraRecorder camera(args.mouse_ID, args.date_time, path, args.serial_number, settings);
         const bool completed = camera.startRecording(args.showPreview, true);
-        // Non-zero on an aborted session so a launcher can tell the difference. The
-        // finished-signal file is written either way.
         return completed ? 0 : 1;
     }
     catch (const std::exception& e) {

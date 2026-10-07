@@ -14,6 +14,7 @@ nlohmann::json Settings::toJson() const
         { "window_height", window_height },
         { "display_fps", display_fps },
         { "recording_mode", recording_mode },
+        { "ring_buffer_mb", ring_buffer_mb },
     };
 
     // Only meaningful for an encoded session, and including it for a raw one

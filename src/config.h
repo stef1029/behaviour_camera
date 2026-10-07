@@ -51,6 +51,16 @@ struct Settings
     std::string recording_mode = "raw";
     VideoSettings video;
 
+    // RAM held between capture and writing. This is the slack that absorbs a
+    // disk stall: at 1.25 MiB a frame, a gigabyte is about 800 frames, roughly
+    // half a minute at 30 fps. It is allocated up front, so four cameras on one
+    // machine cost four times this.
+    int ring_buffer_mb = 1024;
+
+    // Draw the arena alignment guide over the preview, for putting a camera back
+    // where it was last time.
+    bool arena_guide = false;
+
     int window_width = 800;
     int window_height = 600;
     int display_fps = 30;                     // preview only; never what is recorded

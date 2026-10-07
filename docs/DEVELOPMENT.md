@@ -115,13 +115,11 @@ happen only once:
 
 1. **vcpkg bootstraps itself.** `vcpkg.exe` is excluded by vcpkg's own `.gitignore`,
    so a fresh clone does not contain it; the CMake toolchain downloads it.
-2. **Dependencies are installed.** `vcpkg.json` asks for OpenCV, GLFW and
-   nlohmann-json, but OpenCV's default features drag in 26 packages altogether,
-   including protobuf, abseil, flatbuffers, libjpeg-turbo, libpng, libwebp and tiff.
-   On a machine with no vcpkg binary cache these are **compiled from source**.
+2. **Dependencies are installed.** `vcpkg.json` asks for Dear ImGui, GLFW and
+   nlohmann-json. All three are small, so this is quick - it used to pull in
+   OpenCV and its 26 transitive packages, which was most of the first-build time.
 
-Budget an hour and leave it running. On a machine whose vcpkg binary cache is
-already populated the same step took about seven minutes. Afterwards, configuring
+Budget twenty minutes or so on a cold cache, and far less once it is warm. Afterwards, configuring
 takes about five seconds and an incremental build a few seconds, so this cost is
 paid once per machine. [Speeding this up for additional machines](#8-speeding-up-setup-on-more-machines)
 is worth reading if you are commissioning several rigs.
@@ -247,7 +245,7 @@ solution; both read the same presets, so you can switch freely.
 
 All presets share one dependency tree via `VCPKG_INSTALLED_DIR` pointing at
 `vcpkg_installed/` in the source directory. Without that, each preset would build
-its own copy of OpenCV.
+its own copy of every dependency.
 
 **Spinnaker is found, not assumed.** `CMakeLists.txt` uses `find_path`/`find_library`
 under `SPINNAKER_ROOT` and fails with a useful message if the SDK is missing. It
@@ -355,7 +353,7 @@ In rough order of likelihood:
 
 ### Build succeeds but the exe fails to start, or complains about a missing DLL
 
-OpenCV and GLFW DLLs are copied next to the executable automatically, so this
+The vcpkg DLLs are copied next to the executable automatically, so this
 usually means Spinnaker's DLLs are not on `PATH` — normally the installer puts
 `bin64\vs2015` there. Check with:
 
@@ -406,12 +404,10 @@ setx VCPKG_BINARY_SOURCES "clear;files,\\server\share\vcpkg-cache,readwrite"
 The first machine populates it; the rest extract in minutes instead of compiling.
 For reference, the cache on an already-set-up machine here is about 1.2 GB.
 
-There is also a worthwhile opportunity nobody has taken yet: **this project uses
-OpenCV for exactly three lines** — one `cv::Mat` wrapper and one `cv::resize` in the
-preview path. Those pull in all 26 packages. Disabling OpenCV's default features in
-`vcpkg.json`, or dropping OpenCV entirely once the preview scales on the GPU, would
-cut first-build time dramatically and shrink deployments. Left alone for now because
-it needs the preview code changed at the same time.
+OpenCV used to dominate this: it was pulled in for exactly three lines - a
+`cv::Mat` wrapper and a `cv::resize` in the preview - and brought 26 transitive
+packages with it. The preview now scales on the GPU, so OpenCV is gone and the
+remaining dependencies are small.
 
 ---
 

@@ -1,7 +1,7 @@
 # Behaviour Camera
 
 High-speed camera capture for the behaviour rigs, using the Teledyne Spinnaker SDK,
-OpenCV and GLFW. Records raw Mono8 frames to a flat binary file alongside a JSON
+GLFW and Dear ImGui. Records raw Mono8 frames to a flat binary file alongside a JSON
 metadata sidecar and a frame-ID log; `hex_behav`'s post-processing converts the
 binary to video afterwards.
 
@@ -93,6 +93,8 @@ out\build\ninja-release\behaviour_camera.exe --serial_number 26043809 --fps 60
 | `--fps` | Frame rate; clamped to what the camera allows | `60` |
 | `--windowWidth`, `--windowHeight` | Preview window size | `800` x `600` |
 | `--mode` | `raw` or `video` | `raw` |
+| `--ring-buffer-mb` | RAM held between capture and writing | `1024` |
+| `--arena-guide` | Draw the alignment guide on the preview | off |
 | `--rig` | Rig name used in the signal filenames | from the serial |
 | `--exposure-min` | Auto-exposure floor, microseconds | `4000` |
 | `--stream-buffers` | Frames the driver may hold while writing | `300` |
@@ -192,13 +194,35 @@ Reports the Windows settings that affect capture reliability — power plan, USB
 selective suspend, antivirus exclusion, capture drive headroom — and changes nothing
 unless given `-Apply` (as Administrator).
 
+## How a session runs
+
+Three threads, so nothing slow can stall the camera:
+
+| Thread | Does |
+|---|---|
+| capture | grab, copy into a pooled buffer, hand the camera's buffer straight back |
+| writer | drain the ring to disk or the encoder; owns the frame-ID record |
+| main | the preview window, the stop checks, the disk guard |
+
+Between capture and writing sits a ring of preallocated buffers — 1 GB by default,
+about 800 frames or 13 seconds at 60 fps. That is the slack that absorbs a disk
+stall. The camera's own stream buffers add another 5–10 seconds in front of it.
+
+If the writer ever does fall behind far enough to exhaust the ring, frames are
+dropped **deliberately and counted** as `dropped_no_buffer`, separately from
+`dropped_frames` (lost in transit between camera and host). `ring_buffer_peak` is
+recorded every session, so you can see how close you came even when nothing was
+lost — it is the best early warning there is.
+
+The preview shows all of it live: buffer occupancy, both drop counts, write rate,
+measured against target frame rate, disk time remaining, exposure and camera
+temperature. Plus an optional histogram for checking exposure while positioning a
+camera, and an arena guide for putting one back where it was.
+
 ## Known rough edges
 
 Recorded here so they are not rediscovered:
 
-- **Capture, disk writes and the preview all share one thread**, so a disk hiccup
-  stalls capture directly. The stream buffers now absorb several seconds of it, but
-  the underlying design is still single-threaded.
 - `/Zc:__cplusplus` cannot be enabled: `SpinnakerPlatform.h` then expands its
   deprecation macros to `enum [[deprecated]]`, which MSVC rejects (C3837). See the
   comment in `CMakeLists.txt`.

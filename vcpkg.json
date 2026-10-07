@@ -2,7 +2,13 @@
   "name": "behaviour-camera",
   "version-string": "0.1.0",
   "dependencies": [
-    "opencv",
+    {
+      "name": "imgui",
+      "features": [
+        "glfw-binding",
+        "opengl3-binding"
+      ]
+    },
     "glfw3",
     "nlohmann-json"
   ]
