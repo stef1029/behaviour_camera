@@ -4,7 +4,21 @@ Live pose estimation during a session, so a protocol can decide what to do based
 where the mouse is looking. Head angle is the primary quantity; inference runs on
 demand at specific moments, not continuously.
 
-This document is the plan. Nothing here is built yet except where it says so.
+**Status: phase 1 built and measured.** Everything in the first part of this document
+has been implemented and tested against the real camera and real footage. Numbers that
+started as estimates are now measurements, and one of them changed the design -- see
+finding 1. Phase 2, the live viewer and the snapshot API, is designed but not built.
+
+| | |
+|---|---|
+| Frame out (shared memory) | built, 0.54 ms a frame, no effect on the recording |
+| Heading calculation | built, proved identical to the offline analysis |
+| Pose engine | built, 8-10 ms at the 640 crop |
+| Pose server + client | built, **p95 11.6 ms round trip** (clocks locked) |
+| Warmup self-test | built, 6/6 reference mice |
+| hexcontrol peripheral | built, worked protocol gated 12/12 |
+| On a real rig with a mouse | **not yet** |
+| Live viewer + snapshot API | **designed, not built** -- see Phase 2 below |
 
 **Targets:** 30 ms from "protocol asks" to "protocol has an angle". 100 ms is the
 ceiling. Cameras run at 60–120 fps, most likely 100.
@@ -13,10 +27,11 @@ ceiling. Cameras run at 60–120 fps, most likely 100.
 
 ## What was checked, and what it changed
 
-Four findings from reading the existing code and the model files. Two of them change
-the plan from what we discussed before.
+Four findings from reading the existing code and the model files, with what measuring
+them afterwards actually showed. Finding 1 in particular did not survive contact with a
+benchmark, and says so.
 
-### 1. The model is HRNet-w32, not ResNet-50 — this is the main risk
+### 1. The model is HRNet-w32, and the bottleneck was not what it looked like
 
 `config.yaml` says `default_net_type: resnet_50`, but that is only the project
 default. The shuffle that was actually trained is in
@@ -680,6 +695,190 @@ Steps 1-7 are done. What is left needs a rig.
 
 Steps 9 and 10 are the two that could still change something. Everything else is
 finished and measured.
+
+## Phase 2 - the snapshot API and the live viewer
+
+Designed, not built. Three mockups of the window are in `screenshots_temp/`:
+`20_dlc_live_window.png` (normal), `21_dlc_live_flip.png` (flip correction fired),
+`22_dlc_live_miss.png` (no reading, and a GPU in the state that causes it). Every
+keypoint and angle in them is real inference on real frames; only the trial labels and
+times are invented.
+
+### The API: one snapshot, everything derived from it
+
+The current `heading(target_port=...)` asks about one port at a time. Port angles should
+come *with* the snapshot instead, so a protocol can choose a port by looking at the
+geometry rather than guessing one and asking.
+
+```python
+snap = self.pose.snapshot()
+```
+
+One inference, so the heading, every port angle and the position are mutually consistent
+and share one `frame_id`:
+
+```python
+snap.ok                 # False means do not act on it; .reason says why
+snap.heading            # 189.1 degrees, 0-360
+snap.position           # (560, 513) px - the eyes-offset point angles are measured from
+snap.frame_id           # joins to the recorded video and the DAQ
+
+snap.port_angles        # {1: -133.2, 2: -74.9, 3: -8.1, 4: +60.6, 5: +120.2, 6: +173.3}
+snap.port_distances     # {1: 712, 2: 436, 3: 400, ...} px
+```
+
+with the helpers that keep protocols readable:
+
+```python
+snap.angle_to(4)             # +60.6
+snap.facing(4, within=30)    # False - and False when not ok, so no guard needed
+snap.port_ahead(within=60)   # 3, the most aligned port, or None
+snap.ports_by_angle()        # [(3, -8.1), (4, +60.6), (2, -74.9), ...]
+snap.closest_port()          # 3, by distance
+```
+
+**"Nearest" is banned as a name.** Two different questions hide under it: which port the
+mouse is *looking at* (`port_ahead`, by angle) and which it is *standing next to*
+(`closest_port`, by distance). They agree often enough to hide a bug for months.
+
+`heading()` is replaced rather than kept alongside. Nothing is in production yet, and
+two ways to ask the same question is how they drift apart.
+
+### Position in the rig
+
+Three forms, cheapest first:
+
+| | |
+|---|---|
+| `snap.position` | (x, y) px in the full frame - always available |
+| `snap.distance_from_centre` | px - "is it on the scales?" |
+| `snap.position_mm` | optional; needs one number per rig |
+
+For millimetres no new calibration is needed. The configured port coordinates already
+describe a hexagon of known pixel radius - 466 px for rig 3 - so adding the real
+port-circle radius in mm to `pose_tracking:` makes mm-per-pixel fall out of a
+calibration that already exists.
+
+### How the viewer learns what the protocol decided
+
+The hard part, and the reason this needs designing rather than just building.
+
+The server knows the heading, the port angles, the position, the quality and the timing.
+It cannot know which port the protocol *chose*, what trial it is, or what was done with
+the answer - those are decided elsewhere, after the snapshot. So the protocol has to
+tell it, and the right mechanism depends entirely on **when the information exists**.
+
+**Tier 1, known before the snapshot.** Pass it in. Costs nothing:
+
+```python
+snap = self.pose.snapshot(trial=14, phase="cue_onset", target_port=4)
+```
+
+This covers the common case where the protocol already knows which port it is gating on.
+
+**Tier 2, derived from the snapshot microseconds later.** Annotate it:
+
+```python
+target = choose_port(snap)
+snap.note(cue_port=target, decision="gated")
+```
+
+Fire-and-forget on the same socket - no reply is waited for, so about 0.1 ms - and it
+happens *after* the latency-critical part, so it costs the decision nothing. The server
+assigns each snapshot a monotonic id and `note()` uses it implicitly, so a protocol
+never handles one.
+
+**Tier 3, the outcome seconds later** - which port was touched, correct or not. This
+deliberately does **not** go in the pose log. The pose CSV is a record of perception,
+one row per snapshot, written promptly; the trial record is a record of behaviour.
+Holding a pose row open for seconds waiting on an outcome conflates two different things
+and risks losing rows to a crash. They join on `frame_id`, which is already in both and
+already identifies the frame uniquely.
+
+The *viewer* can still show tier 3, because display state does not have to match the
+CSV. A late `snap.note(touched_port=3, correct=False)` updates the viewer's ring for the
+history table even after the row has been flushed.
+
+**When the row is written.** Each row is held briefly - until the next snapshot or about
+2 s, whichever comes first - then written by the log thread that already exists. That
+absorbs tier 2 without delaying anything. No note, and the row goes out with those
+columns blank, which is also what happens if the protocol crashes mid-trial.
+
+**Columns**: fixed ones for `trial`, `phase`, `target_port`, `cue_port`, `decision`,
+plus a free-form `context` JSON column, so adding a field later does not mean changing
+the schema.
+
+A protocol that never calls `note()` works unchanged; the viewer simply shows no chosen
+port. Nothing here is required.
+
+### The viewer, and how it gets frames
+
+One window per rig, launched by the peripheral beside the server, following
+`daq_view_subprocess.py`. DearPyGui, to match the rest of hexcontrol.
+
+The request path must stay clean, so nothing is drawn or encoded on it:
+
+1. On each snapshot the server stashes the raw crop - a ~0.4 MB memcpy, about 0.1 ms -
+   and the keypoints into a small ring.
+2. The **log thread**, already off the hot path, draws the overlay and encodes a JPEG.
+3. The viewer polls `{"cmd": "recent", "since": n}` at about 5 Hz and gets the metadata
+   plus the latest JPEG, roughly 40 KB.
+
+Nothing is encoded unless a viewer has polled within the last few seconds, so a session
+with no window open pays only the memcpy.
+
+**Worth doing and nearly free:** write each snapshot's JPEG into the session folder. At
+~40 KB and a couple of hundred decisions a session that is under 10 MB, and it means the
+exact image behind any decision can be looked at months later - which the CSV alone
+cannot give.
+
+### The health bar
+
+A strip along the bottom, sampled at about 2 Hz. NVML through `nvidia-ml-py` costs
+**0.061 ms for a full sample**, measured, so this is free. (`torch.cuda.utilization()`
+and friends are thin wrappers over the same library and raise without it installed.)
+
+| field | why it is there |
+|---|---|
+| GPU utilisation, VRAM | ordinary health |
+| temperature, power / limit | ordinary health |
+| SM clock / max, **locked or idling** | the single biggest latency factor found anywhere here |
+| memory clock / max, locked or idling | locking only the graphics clock is not enough |
+| throttle reasons, decoded | `GpuIdle` is what cost 94 ms, silently |
+| **NVENC sessions and fps** | the recorder encodes HEVC on this same GPU |
+| pose median latency, % found | whether the thing is actually working |
+
+Two of these earn their place from what this work turned up. The clock and throttle
+fields would have caught the idle-downclock problem on the first session instead of
+after a day of measurement. And NVENC runs on the same card as the inference, so if the
+encoder and the model ever contend, this is the only place it would show.
+
+### What changes where
+
+| | |
+|---|---|
+| `pose_client.py` | `Reading` becomes `Snapshot`; port angles always present; `note()` |
+| `pose_server.py` | all port angles; snapshot ring; `recent` and `note` commands; held rows; optional JPEG saving |
+| `pose_viewer.py` (new) | the DearPyGui window |
+| `pose_tracking.py` | launch a viewer per rig; `show_viewer` config |
+| `rig_config.py` | `show_viewer`, `save_snapshots`, `arena_radius_mm` |
+| `pose_gated_cue.py` | rewritten against `snapshot()` |
+| new dependency | `nvidia-ml-py`, pure Python, in the server environment only |
+
+### Two open questions
+
+**Live-only, or scrollable?** Live-only is much simpler: the latest snapshot plus a short
+history table, as mocked. Scrolling the whole session means keeping every JPEG in the
+viewer. The saved snapshots cover the look-back case, so live-only is the recommendation.
+
+**Should the viewer trigger its own snapshots?** Inference only happens on request today,
+so between trials the window would sit frozen on the last decision. A low-rate background
+snapshot purely for display - say 2 Hz, about 2% of the GPU - would let you watch the
+mouse and confirm tracking before a trial starts. Worth it for a monitor window, but it
+means the log needs a flag separating protocol requests from display ones, or the
+"snapshots taken" count stops meaning decisions.
+
+---
 
 ## What is where
 
