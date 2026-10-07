@@ -54,6 +54,7 @@ def draw_pose(
     cue_port: Optional[int] = None,
     min_likelihood: float = 0.6,
     scale: float = 1.0,
+    crop=None,
 ) -> np.ndarray:
     """Annotate a frame with the keypoints and the heading that came from them.
 
@@ -65,6 +66,14 @@ def draw_pose(
     canvas = to_bgr(image)
     thickness = max(1, int(round(2 * scale)))
     radius = max(2, int(round(4 * scale)))
+
+    # The region actually fed to the model. Worth showing: everything outside it
+    # is invisible to the pose estimate, so a mouse half out of this box is the
+    # explanation for a reading that looks wrong.
+    if crop is not None:
+        cv2.rectangle(canvas, (crop.x, crop.y),
+                      (crop.x + crop.width, crop.y + crop.height),
+                      (90, 90, 90), max(1, int(round(1.5 * scale))), cv2.LINE_AA)
 
     # The spine, as a chain, so a mis-ordered spine is visible as a zigzag.
     spine = [keypoints.get(f"spine_{i}") for i in range(1, 5)]

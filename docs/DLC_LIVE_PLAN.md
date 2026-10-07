@@ -30,21 +30,58 @@ HRNet-w32 is more accurate than ResNet-50 and considerably more expensive, and D
 runs it at full frame resolution (padded to a multiple of 32 — 1280×1024 already is,
 exactly). The 448×448 in that config is the *training* crop, not the inference size.
 
-This machine has an **RTX 4000 Ada (20 GB)**, roughly a third of a 4090's compute. A
-rough estimate for HRNet-w32 over 1.31 Mpx is ~190 GFLOPs, and HRNet's multi-resolution
-fusion is memory-bound rather than compute-bound, so the realistic range is **40–80 ms
-per full-frame inference**. That misses the 30 ms target and crowds the 100 ms ceiling
-before any of the other costs are counted.
+This machine has an **RTX 4000 Ada (20 GB)**. The first draft of this plan estimated
+40-80 ms per full-frame inference and concluded that cropping was therefore essential.
+Measured, the truth was stranger and the conclusion was wrong.
 
-So full-frame inference is not the design. **Region of interest cropping is essential,
-not an optimisation** — see the latency budget below. Cropping a 384×384 window around
-the mouse is 8.9× fewer pixels and brings inference to roughly 5–10 ms, which makes the
-whole budget comfortable. 384 is divisible by 32, so no padding is wasted.
+Eager inference takes **about 33 ms whatever the input size**:
 
-If ROI cropping somehow is not enough, in rough order of what to try: fp16/TF32
-autocast (~2×), TensorRT export (~2–3× more), then retraining with `hrnet_w18` or
-`resnet_50`. You offered to retrain a smaller model — hold that in reserve; it probably
-will not be needed.
+| crop | eager forward pass |
+|---|---|
+| 448x448 | 32.9 ms |
+| 640x640 | 32.6 ms |
+| 1280x1280 | 32.6 ms |
+
+A model whose cost does not change when given seven times fewer pixels is not
+compute-bound. HRNet-w32 is four parallel resolution branches that fuse repeatedly --
+1834 parameter tensors and well over a thousand CUDA kernel launches for one frame -- so
+nearly all of that 33 ms is launch overhead, with the GPU idle between kernels.
+**Cropping a launch-bound model saves nothing**, which is why the original plan was
+treating a symptom.
+
+The fix is to capture the forward pass as a **CUDA graph** and replay it. That collapses
+the launches into a single submission, and the model becomes compute-bound again -- at
+which point cropping works exactly as expected:
+
+| crop | eager | graphed | speedup |
+|---|---|---|---|
+| 448 | 32.9 ms | 6.0 ms | 5.5x |
+| 640 | 32.6 ms | 7.8 ms | 4.2x |
+| 1024 | 32.7 ms | 15.7 ms | 2.1x |
+
+Graph replay is **bit-identical** to eager -- 0.000000 px difference on every keypoint of
+every test frame -- so this costs no accuracy at all. Neither does fp16, which also came
+out bit-identical to fp32 on this model. A graph is tied to one input shape, so changing
+crop size re-captures; capture is guarded and falls back to eager, because a wrong
+answer quickly is worse than a right answer slowly.
+
+TensorRT and a smaller backbone stay in reserve, and neither is needed. Retraining for
+speed is not needed either.
+
+**Choosing the crop size.** Measured with a *fixed* frame-centre crop -- which is what a
+rig actually does -- over frames selected for the mouse being near the middle, as it is
+at trial start. The mouse was up to 158 px off centre, median 105 px. Accuracy is
+measured against what the same model says when it can see the whole frame:
+
+| crop | median | all keypoints found | worst bearing error |
+|---|---|---|---|
+| 768 | 10.1 ms | 100% | 0.01 deg |
+| **640** | **8.1 ms** | **100%** | **0.32 deg** |
+| 512 | 6.6 ms | 92% | - |
+
+**640 is the default.** Below it the crop starts clipping the spine and detection falls
+off a cliff, and the spine is what catches an ear swap. 768 buys more margin for 2 ms if
+a rig frames its arena differently.
 
 ### 2. Port **coordinates**, not port angles
 
@@ -104,9 +141,9 @@ Two magic numbers in the offline code are in pixels:
 `PP_cue_offset_heading.py` declares `frame_height = 1080, frame_width = 1280`. The
 current camera is **1280×1024**. The widths match, so the horizontal scale is the same
 and both numbers carry over almost unchanged — but this needs stating explicitly in the
-live code, and if anyone changes the sensor resolution or ROI-crops *before* computing
+live code, and if anyone changes the sensor resolution or crops *before* computing
 coordinates, both numbers and the port coordinates all break together. The live code
-must compute coordinates in **full-frame pixel space** and map the ROI crop back, never
+must compute coordinates in **full-frame pixel space** and map the crop back, never
 work in crop-local coordinates.
 
 ---
@@ -147,7 +184,7 @@ the arrays that come back.
 The cost structure is: the HRNet backbone does nearly all the work, and the heatmap
 head's output channels scale linearly with keypoint count. Going from 8 keypoints to 6
 would shave a low single-digit percentage off a number dominated by the backbone —
-unmeasurable next to the 8.9× that ROI cropping buys.
+unmeasurable next to what CUDA graphs and cropping buy.
 
 The practical consequence: **drop nose and head in the post-processing, not the model.**
 And if you do retrain later for speed, the win comes from a smaller backbone
@@ -247,7 +284,7 @@ Three pieces, each independently testable, with the recorder's reliability ring-
 └─────────────────────────────────────┘
                  │  read-only, seqlock
 ┌─ dlc_live_server.py (Part B) ───────┐
-│  shm → ROI crop → HRNet → keypoints │   separate process, separate GPU work
+│  shm → centre crop → HRNet → points │   separate process, separate GPU work
 │      → heading (offline algorithm)  │
 └─────────────────────────────────────┘
                  │  request/reply
@@ -304,7 +341,7 @@ Responsibilities:
 1. Load the model at startup; report ready or fail loudly.
 2. **Warmup with the test images** (below).
 3. Attach to the shared memory block.
-4. On request: grab the latest frame, ROI crop, infer, compute the heading with the
+4. On request: grab the latest frame, centre crop, infer, compute the heading with the
    algorithm above, reply.
 5. Keepalive: one throwaway inference every ~500 ms when idle, so the GPU does not
    clock down between requests. Without this the first inference after a quiet period
@@ -312,11 +349,17 @@ Responsibilities:
    when it matters, because the quiet period is the inter-trial interval.
 6. Log every inference to disk.
 
-**ROI tracking.** Keep the previous detection's ear midpoint and crop 384×384 around
-it. If the mean likelihood of the needed keypoints drops below a threshold, or nothing
-has been inferred for a while, fall back to one full-frame inference to re-acquire. All
-coordinates are mapped back to full-frame space before any angle is computed, since the
-port coordinates and both pixel thresholds live in that space.
+**A fixed centre crop, not ROI tracking.** The first draft of this plan tracked the
+mouse between frames and cropped around its last known position, with a full-frame
+re-acquire when it lost confidence. That machinery turned out to be unnecessary: a
+reading is only taken while the mouse is on the scales, so it is reliably near the
+middle of the frame, and a fixed 640 centre crop finds every keypoint with the mouse up
+to 158 px off centre. No tracking state, no re-acquire path, nothing to go stale, and
+one less thing that can be subtly wrong after a camera is nudged.
+
+The crop centre is configurable per rig for a camera whose scales are not in the middle
+of its frame. All coordinates are mapped back to full-frame space before any angle is
+computed, since the port coordinates and both pixel thresholds live there.
 
 **Model loading, and the thing to verify first.** DeepLabCut-Live was written against
 TensorFlow; this model is a DLC 3.x PyTorch model. Whether the current `dlclive`
@@ -476,7 +519,7 @@ pose_tracking:
   model: "Y:/srogers/Behaviour/DEEPLABCUT_models/250822_wildtype_chemo_model_superanimal/project_folders/no_implant_superanimal-StefanRC-2025-08-22"
   snapshot: "snapshot-200.pt"      # omit for the latest
   warmup_images: "Y:/srogers/Behaviour/DEEPLABCUT_models/_reference_frames"
-  roi_size: 384
+  crop_size: 640
   min_likelihood: 0.6
 ```
 
@@ -505,35 +548,36 @@ re-verify with `calibrate_port_coordinates` if a camera is ever moved.
 
 ---
 
-## Latency budget at 100 fps
+## Latency budget at 100 fps - measured
 
-With ROI cropping, which finding 1 makes mandatory:
+End to end through the real server and client, on real mouse footage at the 640 crop,
+40 requests:
 
-| Stage | Expected | Notes |
-|---|---|---|
-| Frame age when requested | 0–10 ms | uniform; the request lands mid-frame-period |
-| Shared memory read | <1 ms | 1.31 MB memcpy |
-| ROI crop, to tensor, to GPU | 1–2 ms | crop first, so only 147 kB uploads |
-| **HRNet-w32 on 384×384** | **5–10 ms** | the figure to measure first |
-| Heatmap decode + refine | 1–3 ms | |
-| Heading, flip check, port angles | <0.5 ms | pure arithmetic |
-| IPC back to the protocol | ~1 ms | local |
-| **Subtotal** | **~10–28 ms** | |
-| Rig command round trip | 2–5 ms | your figure, outside our control |
-| **Total** | **~12–33 ms** | |
+| | |
+|---|---|
+| readings returned | 40/40 (100%) |
+| round trip | **median 11.9 ms, p95 25.6 ms** |
+| of which the model | median 10.3 ms |
 
-That lands on the 30 ms target with little margin, and well inside the 100 ms ceiling.
-Full-frame inference instead would put the subtotal at 45–90 ms — inside the ceiling,
-missing the target. Hence ROI.
+**p95 25.6 ms is inside the 30 ms target**, before the rig's own few milliseconds of
+command round trip.
 
-Two honest caveats. The 5–10 ms inference figure is an estimate for HRNet-w32 on an
-RTX 4000 Ada and **must be measured before anything is built on it** — it is the one
-number the whole budget rests on. And the frame-age term means the *worst case* is
-about a frame period worse than the average; running at 100 rather than 60 fps cuts
-that term from 0–17 ms to 0–10 ms, which is a good reason for the higher frame rate
+Against the camera itself, the frame-out half measured separately at 100 fps: copying
+the newest frame out of shared memory costs **median 0.59 ms, worst 1.88 ms**, and the
+recorder dropped nothing (0 in transit, 0 writer-behind, ring buffer peak 71 of 819).
+
+Two honest caveats.
+
+**The cold first inference is 320-660 ms**, against 6-10 ms warm, because CUDA is
+choosing convolution algorithms and capturing the graph. Without the warmup that lands
+on the first trial of a session. This is why the warmup is not a nicety, and why the
+keepalive exists: the first request after a quiet stretch would otherwise pay part of
+that again, and the quiet stretch is the inter-trial interval.
+
+**Frame age adds up to one frame period.** A request lands at a uniformly random point
+in the frame period, so the newest frame is on average half a period old. At 100 fps
+that is 0-10 ms; at 60 fps it would be 0-17 ms. A good reason for the higher frame rate
 quite apart from the data.
-
----
 
 ## Benchmarking
 
@@ -542,15 +586,18 @@ long sessions with mice in them.
 
 What to measure, in order:
 
-1. **Inference time alone**, full-frame vs 384×384 ROI, fp32 vs autocast. This decides
-   whether the plan above holds. Do this before writing any of Part A.
-2. **Agreement with the offline pipeline.** Run the live path over frames from a session
-   that has already been through full post-processing, and compare bearings. They should
-   match to within floating-point noise, since it is the same algorithm. Any systematic
-   difference — especially a 180° cluster — is a bug in the flip correction's
-   transcription.
-3. **ROI tracking robustness.** How often does the ROI lose the mouse and need a
-   full-frame re-acquire? Fast turns and rears are the cases to watch.
+1. ~~**Inference time alone**, and at what crop.~~ **Answered**: see finding 1. CUDA
+   graphs were the thing that mattered; 640 crop at 8.1 ms.
+2. ~~**Agreement with the offline pipeline.**~~ **Answered, and this was the gate.**
+   `tests/test_head_angle.py` imports the real `Session_nwb.find_angles`, binds it to a
+   stub carrying only the attributes it reads, and runs both implementations over 620
+   randomised poses. They agree on every case, across all three correction paths. The
+   ear-swap check matters more than the agreement: swapping the two ear labels is
+   exactly the mistake DeepLabCut makes, and the corrected bearing came back identical
+   on 300/300 swapped poses.
+3. ~~**Crop robustness.**~~ **Answered** for recorded footage: 100% detection at 640
+   with the mouse up to 158 px off centre. Still worth re-checking on a rig, where the
+   crop is fixed at the scales rather than placed around a known mouse.
 4. **Keypoint quality at the new frame rate.** Old footage is 30 fps with a longer
    exposure; at 100 fps the exposure is necessarily shorter and the images are darker
    and noisier. The model was trained on the old look. This is a real risk to
@@ -566,21 +613,63 @@ is an empirical question with a potentially inconvenient answer.
 
 ## Order of work
 
-1. **Settle the `dlclive` / PyTorch question.** Half-hour experiment. Decides Part B's shape.
-2. **Benchmark inference** on audiospatial frames, full-frame vs ROI. Decides whether the
-   budget holds. Nothing else should start before these two.
-3. **Part A — frame out.** Self-contained C++ in this repo, testable with a small Python
-   script that attaches and saves a PNG. Ready to build now.
-4. **Part B — the DLC server**, with the warmup and the logging, driven from the command
-   line first so it can be developed without hexcontrol in the loop.
-5. **Validate against the offline pipeline** (benchmark point 2) before wiring anything
-   into a protocol. This is the gate: if live and offline disagree, nothing downstream
-   is trustworthy.
-6. **Part C — the peripheral**, the `pose=` context, and the YAML spec.
-7. **A test protocol** that does nothing but log headings, to run on a real rig before
-   any experiment depends on it.
-8. **A 100 fps test recording** and a check on keypoint quality (benchmark point 4) — in
-   parallel with the above, since a bad answer means retraining.
+Steps 1-7 are done. What is left needs a rig.
 
-Steps 1 and 2 are the ones that could change this plan. Everything after step 3 is
-ordinary work.
+1. ~~Settle the `dlclive` / PyTorch question.~~ **Done, and the answer was no.**
+   DeepLabCut-Live's latest release is 1.1.0, from the TensorFlow era, and will not load
+   a DLC 3 PyTorch snapshot; it is not installable on Python 3.11 at all. DeepLabCut 3's
+   own inference API does the job and is what the engine uses.
+2. ~~Benchmark inference.~~ **Done**, and it rewrote finding 1: CUDA graphs, not
+   cropping, were the thing that mattered. 640 crop at 8.1 ms.
+3. ~~Frame out.~~ **Done.** 0.59 ms a frame, nothing dropped.
+4. ~~The DLC server~~, with the warmup and the logging. **Done**, driveable from the
+   command line, with a replay mode so a protocol can be tested without a rig.
+5. ~~Validate against the offline pipeline.~~ **Done, and this was the gate.** The
+   heading calculation is proved identical to `Session_nwb.find_angles` over 620
+   randomised poses covering all three correction paths, and the ear-swap flip
+   correction recovers the same bearing on 300/300 deliberately swapped poses.
+6. ~~The peripheral, the `pose=` context, and the YAML spec.~~ **Done.**
+7. ~~A test protocol.~~ **Done**: `pose_gated_cue.py` gated 12/12 trials end to end
+   against a live server on real footage, and runs unchanged with pose tracking off.
+8. **Run it on a rig with a mouse.** Everything above used recorded footage or the bench
+   camera. What cannot be checked without a rig: whether the port coordinates are right
+   for that camera's framing, whether the mouse really is inside a 640 centre crop when
+   it is on the scales, and whether the round trip holds up with the behaviour system
+   also running.
+9. **Check keypoint quality at 100 fps.** This is the one that could still cost
+   something. The model was trained on 30 fps footage; at 100 fps the exposure is
+   necessarily shorter and frames are darker and noisier. Archive video cannot answer
+   it -- it needs a short test recording on a rig. Worth doing early, because the answer
+   might be "retrain on 100 fps frames", which has a long lead time.
+10. **Verify each rig's port coordinates** by drawing them over a real frame from that
+    rig. `scripts/pose_warmup_check.py --ports` does this. Drawing rig 3's coordinates
+    over footage from another rig puts them visibly in the wrong place, which is exactly
+    the error that would otherwise show up months later as a systematic offset in the
+    analysis.
+
+Steps 9 and 10 are the two that could still change something. Everything else is
+finished and measured.
+
+## What is where
+
+| | |
+|---|---|
+| `src/frame_out.{h,cpp}` | publishes the newest frame to shared memory |
+| `python/frame_out_reader.py` | the reader; mirrors the header, version-checked |
+| `python/head_angle.py` | the heading calculation, identical to offline |
+| `python/pose_engine.py` | model loading, CUDA graph, crop, inference |
+| `python/pose_warmup.py` | the startup self-test |
+| `python/pose_overlay.py` | drawing keypoints, heading and ports |
+| `python/pose_server.py` | one process per rig; serves headings, logs them |
+| `python/pose_client.py` | what a protocol uses; standard library only |
+| `tests/test_head_angle.py` | the equivalence gate against hex_behav_analysis |
+| `scripts/benchmark_pose.py` | the crop-size and timing sweep |
+| `scripts/test_frame_out.py` | checks the shared memory block |
+| `scripts/test_pose_live.py` | the end-to-end round trip |
+| `scripts/pose_warmup_check.py` | run the warmup on its own |
+| `hexcontrol/core/peripherals/pose_tracking.py` | the peripheral |
+| `hexcontrol/protocols/pose_gated_cue.py` | the worked example protocol |
+
+The environment is the conda env `dlclive`: torch 2.6.0+cu124 and deeplabcut 3.0.2.
+hexcontrol does not need it -- only the server does, and the peripheral launches it by
+path.
