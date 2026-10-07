@@ -44,6 +44,8 @@ computer. The short version:
 - **Teledyne Spinnaker SDK**, installed to `C:/Program Files/Teledyne/Spinnaker`.
   Point `SPINNAKER_ROOT` elsewhere if yours is not there.
 - **vcpkg**, included as a git submodule. Dependencies install on first configure.
+- **ffmpeg** with NVENC, on PATH. Only needed for `--mode video`; a rig set to
+  video without it fails when a session starts, not at build time.
 - **Python 3** is optional, used only by the recording verifier.
 
 From nothing to a built binary:

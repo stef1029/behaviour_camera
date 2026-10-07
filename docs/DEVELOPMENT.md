@@ -68,6 +68,25 @@ VS Code will offer to install them when you first open the folder:
 - **CMake Tools** (`ms-vscode.cmake-tools`)
 - **C/C++** (`ms-vscode.cpptools`)
 
+### ffmpeg (required for `--mode video`)
+
+The recorder pipes frames to ffmpeg to encode them on the GPU, so `--mode video`
+needs `ffmpeg` and `ffprobe` on PATH. Raw mode does not touch it, so a machine
+that only ever records `.bin` can skip this — but a rig configured for video and
+missing ffmpeg fails at the *start of a session*, which is the worst moment to
+find out.
+
+Get a build with NVENC in it (the gyan.dev or BtbN Windows builds both have it),
+unpack it somewhere permanent, and put its `bin` on PATH. Then:
+
+```sh
+ffmpeg -hide_banner -encoders | findstr nvenc
+```
+
+You want `hevc_nvenc` in that list. If ffmpeg runs but that line is missing, you
+have a build without NVENC and encoding will fail on an NVIDIA card that is
+perfectly capable.
+
 ### Python 3 (optional)
 
 Only used by `scripts\check_recording.py`, which verifies a recorded session. Any
@@ -365,6 +384,21 @@ If that finds nothing, add `C:\Program Files\Teledyne\Spinnaker\bin64\vs2015` to
 `PATH` and open a new terminal, or configure with
 `-DINSTALL_SPINNAKER_RUNTIME=ON` and run `cmake --install` for a self-contained copy.
 
+### `Could not start the encoder. Is ffmpeg installed and on PATH?`
+
+Exactly what it says, and it happens at the start of a recording rather than at
+build time. Either install ffmpeg (above), or record with `--mode raw`, which
+needs nothing extra.
+
+If ffmpeg *is* on PATH and this still appears, check it is on PATH for the
+account the rig software runs as — a PATH edit made in a user session does not
+reach a service or a scheduled task until it is restarted.
+
+### `Unknown encoder 'hevc_nvenc'`
+
+ffmpeg is installed but was built without NVENC. Replace it with a build that
+has it; `ffmpeg -encoders | findstr nvenc` should list `hevc_nvenc`.
+
 ### `cannot be loaded because running scripts is disabled on this system`
 
 You ran `scripts\test_camera.ps1` directly. Use `test_camera.cmd`, which passes
@@ -430,5 +464,21 @@ for capture reliability and have nothing to do with the compiler:
 One camera at 1280×1024 Mono8 needs about 39 MB/s at 30 fps or 79 MB/s at 60 fps,
 and roughly 141 GB per hour at 30 fps. Size the drive from the longest session you
 intend to run, times the number of cameras.
+
+### If the rig also does live pose estimation
+
+Three more things, none of which affect recording:
+
+- **Lock the GPU clocks.** `PoseLink/scripts/configure_gpu.ps1 -Apply`, as
+  Administrator. An idle GPU clocks down far enough that an occasional inference
+  costs ten times what it should, and this is silent — nothing fails, answers
+  just arrive late. **It does not survive a reboot**, so put it in a startup
+  task.
+- **Start the recorder with `--frame-out`**, which publishes frames to shared
+  memory for the pose server to read. Off by default, and about 0.5 ms a frame
+  when on.
+- **Everything else lives in PoseLink**, in `hex_behav_control`, including its
+  own setup guide and the things that go wrong doing it. Nothing about
+  DeepLabCut is installed or configured in this repository.
 
 See `README.md` for the known rough edges in the recorder itself.
