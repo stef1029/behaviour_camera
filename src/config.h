@@ -57,6 +57,11 @@ struct Settings
     // machine cost four times this.
     int ring_buffer_mb = 1024;
 
+    // Publish each frame to a shared memory block so another process can read
+    // it for live pose estimation. Off by default: it costs about 0.3 ms of the
+    // capture thread per frame, which is worth nothing to a rig not using it.
+    bool frame_out = false;
+
     // Start with the exposure histogram visible, for setting a camera up.
     bool show_histogram = false;
 

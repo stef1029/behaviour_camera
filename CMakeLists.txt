@@ -137,6 +137,7 @@ endfunction()
 add_executable(behaviour_camera
     src/main.cpp
     src/config.cpp
+    src/frame_out.cpp
     src/frame_sink.cpp
     src/preview.cpp
 )

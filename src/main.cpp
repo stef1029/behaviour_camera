@@ -21,6 +21,7 @@
 #include <SpinGenApi/SpinnakerGenApi.h>
 
 #include "config.h"
+#include "frame_out.h"
 #include "frame_pipeline.h"
 #include "frame_sink.h"
 #include "preview.h"
@@ -34,6 +35,8 @@ using json = nlohmann::json;
 namespace fs = std::filesystem;
 using behaviour_camera::Settings;
 using behaviour_camera::FrameSink;
+using behaviour_camera::FrameOut;
+using behaviour_camera::kFrameOutMono8;
 using behaviour_camera::Frame;
 using behaviour_camera::FramePool;
 using behaviour_camera::FrameQueue;
@@ -268,6 +271,22 @@ public:
         pool = make_unique<FramePool>(frameBytes, poolFrames);
         previewSlot = make_unique<PreviewSlot>(frameBytes);
 
+        // Live pose estimation reads frames out of shared memory. It is optional
+        // and must never cost a recording, so a failure here is a warning and the
+        // session carries on without it.
+        if (settings.frame_out) {
+            try {
+                frameOut = make_unique<FrameOut>(
+                    FrameOut::nameForRig(rig),
+                    static_cast<uint32_t>(imageWidth), static_cast<uint32_t>(imageHeight),
+                    static_cast<uint32_t>(imageWidth), frameBytes, kFrameOutMono8);
+                cout << "Frame out: " << frameOut->name() << endl;
+            }
+            catch (const std::exception& e) {
+                cerr << "Warning: no frame out (" << e.what() << "). Recording anyway." << endl;
+            }
+        }
+
         cout << "Ring buffer: " << poolFrames << " frames ("
              << (poolFrames * frameBytes) / (1024 * 1024) << " MB, "
              << (FPS > 0 ? poolFrames / FPS : 0.0) << " s of slack)" << endl;
@@ -401,6 +420,14 @@ private:
 
                 if (previewSlot->wanted()) {
                     previewSlot->publish(data, size, frameID);
+                }
+
+                // Unconditional: the publisher never checks for a reader, so the
+                // cost is the same whether anything is listening or not. About
+                // 0.3 ms for a 1.3 MB frame, 3% of a 10 ms period at 100 fps.
+                if (frameOut) {
+                    frameOut->publish(data, size, frameID,
+                                      counters.framesCaptured.load());
                 }
 
                 if (!saveVideo_) {
@@ -988,6 +1015,7 @@ private:
     unique_ptr<FrameSink> sink;
     unique_ptr<FramePool> pool;
     unique_ptr<PreviewSlot> previewSlot;
+    unique_ptr<FrameOut> frameOut;
     FrameQueue queue;
     behaviour_camera::Counters counters;
 
@@ -1063,6 +1091,7 @@ void printUsage()
         "  --windowWidth <px>     preview width\n"
         "  --windowHeight <px>    preview height\n"
         "  --histogram            start with the exposure histogram showing\n"
+        "  --frame-out            publish frames to shared memory for live pose\n"
         "  --no-preview           record without a preview window\n"
         "\n"
         "  --help                 this message\n"
@@ -1091,6 +1120,7 @@ struct Arguments
     optional<int> windowHeight;
     bool showPreview = true;
     bool histogram = false;
+    bool frameOut = false;
 };
 
 // Returns false if the program should stop: either --help, or an argument that
@@ -1107,6 +1137,10 @@ bool parseArguments(int argc, char** argv, Arguments& args, int& exitCode)
         }
         if (arg == "--histogram") {
             args.histogram = true;
+            continue;
+        }
+        if (arg == "--frame-out") {
+            args.frameOut = true;
             continue;
         }
         if (arg == "--no-preview") {
@@ -1197,6 +1231,7 @@ int main(int argc, char** argv)
     if (args.windowWidth)     settings.window_width = *args.windowWidth;
     if (args.windowHeight)    settings.window_height = *args.windowHeight;
     settings.show_histogram = args.histogram;
+    settings.frame_out = args.frameOut;
 
     string path = args.path;
     if (path.empty()) {
