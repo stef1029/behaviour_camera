@@ -15,12 +15,11 @@ namespace {
 
 constexpr int kHistogramBins = 64;
 constexpr size_t kHistoryLength = 120;      // ~60 s at two samples a second
-constexpr float kLabelColumn = 150.0f;
 
-const ImVec4 kGreen(0.40f, 0.80f, 0.50f, 1.0f);
-const ImVec4 kAmber(0.95f, 0.72f, 0.30f, 1.0f);
-const ImVec4 kRed(0.93f, 0.40f, 0.40f, 1.0f);
-const ImVec4 kDim(0.55f, 0.57f, 0.62f, 1.0f);
+const ImVec4 kGreen(0.45f, 0.85f, 0.55f, 1.0f);
+const ImVec4 kAmber(0.97f, 0.76f, 0.35f, 1.0f);
+const ImVec4 kRed(0.97f, 0.45f, 0.45f, 1.0f);
+const ImVec4 kDim(0.60f, 0.63f, 0.68f, 1.0f);
 
 std::string text(const char* fmt, double value)
 {
@@ -32,16 +31,25 @@ std::string text(const char* fmt, double value)
 std::string humanDuration(double seconds)
 {
     if (seconds < 0) {
-        return "unknown";
+        return "?";
     }
-    char buffer[64];
+    char buffer[48];
     if (seconds < 90) {
-        std::snprintf(buffer, sizeof(buffer), "%.0f s", seconds);
+        std::snprintf(buffer, sizeof(buffer), "%.0fs", seconds);
     } else if (seconds < 5400) {
-        std::snprintf(buffer, sizeof(buffer), "%.0f min", seconds / 60.0);
+        std::snprintf(buffer, sizeof(buffer), "%.0fmin", seconds / 60.0);
     } else {
-        std::snprintf(buffer, sizeof(buffer), "%.1f h", seconds / 3600.0);
+        std::snprintf(buffer, sizeof(buffer), "%.1fh", seconds / 3600.0);
     }
+    return buffer;
+}
+
+std::string elapsedClock(double seconds)
+{
+    const int total = static_cast<int>(seconds);
+    char buffer[32];
+    std::snprintf(buffer, sizeof(buffer), "%d:%02d:%02d",
+                  total / 3600, (total / 60) % 60, total % 60);
     return buffer;
 }
 
@@ -53,18 +61,14 @@ ImVec4 occupancyColour(double fraction)
     return kRed;
 }
 
-// A label on the left and a value on the right, so the numbers line up and can
-// be read down the column rather than hunted for.
-void row(const char* label, const std::string& value, const ImVec4* colour = nullptr)
+// One piece of the bottom banner, with the colour it should be drawn in and how
+// readily it can be dropped when the window is too narrow to hold everything.
+struct Segment
 {
-    ImGui::TextColored(kDim, "%s", label);
-    ImGui::SameLine(kLabelColumn);
-    if (colour) {
-        ImGui::TextColored(*colour, "%s", value.c_str());
-    } else {
-        ImGui::TextUnformatted(value.c_str());
-    }
-}
+    std::string label;
+    ImVec4 colour;
+    int priority;    // lower is kept longer
+};
 
 } // namespace
 
@@ -101,9 +105,8 @@ Preview::Preview(int width, int height, const std::string& title,
     ImGui::StyleColorsDark();
 
     ImGuiStyle& style = ImGui::GetStyle();
-    style.WindowPadding = ImVec2(10, 10);
-    style.FramePadding = ImVec2(6, 4);
-    style.ItemSpacing = ImVec2(8, 6);
+    style.WindowPadding = ImVec2(0, 0);
+    style.ItemSpacing = ImVec2(6, 4);
     style.WindowBorderSize = 0.0f;
 
     if (!ImGui_ImplGlfw_InitForOpenGL(window_, true) ||
@@ -185,15 +188,13 @@ void Preview::computeHistogram(const std::vector<uint8_t>& image)
 
 void Preview::sampleHistory(const PreviewStatus& status)
 {
-    // Updated every drawn frame, not just when a sample is taken.
+    // Updated every drawn frame, not only when a sample is taken.
     const double occupancyNow = status.bufferCapacity > 0
         ? static_cast<double>(status.bufferDepth) / static_cast<double>(status.bufferCapacity)
         : 0.0;
     bufferPeakSinceSample_ = std::max(bufferPeakSinceSample_,
                                       static_cast<float>(occupancyNow * 100.0));
 
-    // Twice a second, so the traces cover about a minute without the cost of
-    // sampling every drawn frame.
     if (lastSampleSeconds_ >= 0 && status.elapsedSeconds - lastSampleSeconds_ < 0.5) {
         return;
     }
@@ -212,37 +213,140 @@ void Preview::sampleHistory(const PreviewStatus& status)
     while (bufferHistory_.size() > kHistoryLength) bufferHistory_.pop_front();
 }
 
-// One line you can read from across the room: is this rig fine or not?
-void Preview::drawBanner(const PreviewStatus& status)
+// The one line you can read from across the room.
+void Preview::drawTopBanner(const PreviewStatus& status, float height)
 {
     const int64_t lost = status.droppedInTransit + status.droppedNoBuffer;
     const bool trouble = lost > 0 || status.cameraResets > 0;
-
     const ImVec4 colour = trouble ? kRed : kGreen;
-    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(colour.x * 0.18f, colour.y * 0.18f,
-                                                   colour.z * 0.18f, 1.0f));
-    ImGui::BeginChild("##banner", ImVec2(0, 56), ImGuiChildFlags_None);
-    ImGui::SetCursorPos(ImVec2(12, 8));
 
-    ImGui::PushStyleColor(ImGuiCol_Text, colour);
-    ImGui::Text("%s", trouble ? "RECORDING - FRAMES LOST" : "RECORDING");
-    ImGui::PopStyleColor();
+    ImGui::PushStyleColor(ImGuiCol_ChildBg,
+                          ImVec4(colour.x * 0.16f, colour.y * 0.16f, colour.z * 0.16f, 1.0f));
+    ImGui::BeginChild("##top", ImVec2(0, height), ImGuiChildFlags_None,
+                      ImGuiWindowFlags_NoScrollbar);
 
-    ImGui::SetCursorPosX(12);
-    if (trouble) {
-        ImGui::TextColored(kRed, "%lld frames, %lld lost", static_cast<long long>(status.framesWritten),
-                           static_cast<long long>(lost));
+    ImGui::SetCursorPos(ImVec2(10, (height - ImGui::GetTextLineHeight()) * 0.5f));
+    ImGui::TextColored(colour, "%s", trouble ? "FRAMES LOST" : "RECORDING");
+
+    ImGui::SameLine();
+    ImGui::TextColored(kDim, " %s ", status.rig.c_str());
+    ImGui::SameLine();
+    ImGui::Text("%lld frames", static_cast<long long>(status.framesWritten));
+    ImGui::SameLine();
+    if (lost > 0) {
+        ImGui::TextColored(kRed, " %lld lost", static_cast<long long>(lost));
     } else {
-        ImGui::TextColored(kDim, "%lld frames, none lost, %s",
-                           static_cast<long long>(status.framesWritten),
-                           humanDuration(status.elapsedSeconds).c_str());
+        ImGui::TextColored(kDim, " none lost");
+    }
+    ImGui::SameLine();
+    ImGui::TextColored(kDim, " %s", elapsedClock(status.elapsedSeconds).c_str());
+
+    ImGui::EndChild();
+    ImGui::PopStyleColor();
+}
+
+// The numbers behind the banner, trimmed from the least important end if the
+// window is narrow rather than running off the edge.
+void Preview::drawBottomBanner(const PreviewStatus& status, float height)
+{
+    std::vector<Segment> segments;
+
+    const bool behind = status.targetFps > 0 && status.measuredFps < status.targetFps * 0.95;
+    segments.push_back({ text("%.1f", status.measuredFps) + "/" +
+                             text("%.0f fps", status.targetFps),
+                         behind ? kAmber : kGreen, 0 });
+
+    const double fraction = status.bufferCapacity > 0
+        ? static_cast<double>(status.bufferDepth) / static_cast<double>(status.bufferCapacity)
+        : 0.0;
+    const double peakFraction = status.bufferCapacity > 0
+        ? static_cast<double>(status.bufferHighWater) / static_cast<double>(status.bufferCapacity)
+        : 0.0;
+    segments.push_back({ "buf " + text("%.0f%%", fraction * 100.0) +
+                             " pk " + text("%.0f%%", peakFraction * 100.0),
+                         occupancyColour(peakFraction), 1 });
+
+    segments.push_back({ text("%.0f MB/s", status.writeMegabytesPerSecond), kDim, 2 });
+
+    const bool lowDisk = status.diskSecondsRemaining >= 0 && status.diskSecondsRemaining < 1800;
+    segments.push_back({ "disk " + humanDuration(status.diskSecondsRemaining),
+                         lowDisk ? kRed : kDim, 2 });
+
+    if (status.exposureMicroseconds >= 0) {
+        // Exposure caps the frame rate: it cannot exceed one frame period.
+        const bool capping = status.targetFps > 0 &&
+                             status.exposureMicroseconds > 1e6 / status.targetFps * 0.95;
+        segments.push_back({ "exp " + text("%.1f ms", status.exposureMicroseconds / 1000.0),
+                             capping ? kAmber : kDim, 3 });
+    }
+
+    if (status.intervalMedianMs > 0) {
+        segments.push_back({ "p99 " + text("%.1f ms", status.intervalP99Ms), kDim, 4 });
+    }
+
+    if (status.temperatureCelsius > -100) {
+        const bool hot = status.temperatureCelsius > 75.0;
+        segments.push_back({ text("%.0f C", status.temperatureCelsius),
+                             hot ? kRed : kDim, 5 });
+    }
+
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.10f, 0.10f, 0.12f, 1.0f));
+    ImGui::BeginChild("##bottom", ImVec2(0, height), ImGuiChildFlags_None,
+                      ImGuiWindowFlags_NoScrollbar);
+
+    const char* hint = "d detail   h histogram   esc stop";
+    const float hintWidth = ImGui::CalcTextSize(hint).x;
+    const float separator = ImGui::CalcTextSize("   ").x;
+    const float available = ImGui::GetContentRegionAvail().x - 20.0f;
+
+    // Drop from the least important end until what remains fits, so a narrow
+    // window loses the temperature rather than the frame rate. The key hint is
+    // not reserved space here: it is a reminder you read once, so the numbers
+    // keep the room and the hint appears only if it still fits afterwards.
+    int cutPriority = 5;
+    float used = 0.0f;
+    while (cutPriority > 0) {
+        used = 0.0f;
+        for (const Segment& segment : segments) {
+            if (segment.priority <= cutPriority) {
+                used += ImGui::CalcTextSize(segment.label.c_str()).x + separator;
+            }
+        }
+        if (used <= available) {
+            break;
+        }
+        --cutPriority;
+    }
+    const bool roomForHint = used + hintWidth + separator <= available;
+
+    ImGui::SetCursorPos(ImVec2(10, (height - ImGui::GetTextLineHeight()) * 0.5f));
+    bool first = true;
+    for (const Segment& segment : segments) {
+        if (segment.priority > cutPriority) {
+            continue;
+        }
+        if (!first) {
+            ImGui::SameLine(0.0f, separator);
+        }
+        first = false;
+        ImGui::TextColored(segment.colour, "%s", segment.label.c_str());
+    }
+
+    // Right-aligned, so the keys sit in the same place whatever else is shown.
+    if (roomForHint) {
+        const float hintX = ImGui::GetWindowWidth() - hintWidth - 10.0f;
+        ImGui::SameLine();
+        if (hintX > ImGui::GetCursorPosX()) {
+            ImGui::SetCursorPosX(hintX);
+        }
+        ImGui::TextColored(ImVec4(0.42f, 0.44f, 0.48f, 1.0f), "%s", hint);
     }
 
     ImGui::EndChild();
     ImGui::PopStyleColor();
 }
 
-void Preview::drawImagePanel(const PreviewStatus& status)
+void Preview::drawImage()
 {
     const ImVec2 available = ImGui::GetContentRegionAvail();
     if (available.x <= 1.0f || available.y <= 1.0f || !haveImage_) {
@@ -265,152 +369,82 @@ void Preview::drawImagePanel(const PreviewStatus& status)
     const ImVec2 offset((available.x - size.x) * 0.5f, (available.y - size.y) * 0.5f);
     ImGui::SetCursorPos(ImVec2(ImGui::GetCursorPosX() + offset.x,
                                ImGui::GetCursorPosY() + offset.y));
-
-    const ImVec2 topLeft = ImGui::GetCursorScreenPos();
     ImGui::Image((ImTextureID)(intptr_t)texture_, size);
-
-    // A few numbers burned into the corner of the image, so a screenshot or a
-    // glance at just the video tells you the state without the side panel.
-    ImDrawList* draw = ImGui::GetWindowDrawList();
-    char line[128];
-    const int64_t lost = status.droppedInTransit + status.droppedNoBuffer;
-    std::snprintf(line, sizeof(line), "%.1f fps   %lld frames   %lld lost",
-                  status.measuredFps, static_cast<long long>(status.framesWritten),
-                  static_cast<long long>(lost));
-
-    const ImVec2 textSize = ImGui::CalcTextSize(line);
-    const ImVec2 pad(8, 5);
-    const ImVec2 boxTopLeft(topLeft.x + 10, topLeft.y + 10);
-    draw->AddRectFilled(boxTopLeft,
-                        ImVec2(boxTopLeft.x + textSize.x + pad.x * 2,
-                               boxTopLeft.y + textSize.y + pad.y * 2),
-                        IM_COL32(0, 0, 0, 150), 4.0f);
-    draw->AddText(ImVec2(boxTopLeft.x + pad.x, boxTopLeft.y + pad.y),
-                  lost > 0 ? IM_COL32(237, 102, 102, 255) : IM_COL32(230, 230, 230, 255),
-                  line);
 }
 
-void Preview::drawHistogram()
+// The things that will not fit on a line: the traces, and the interval tail.
+// Drawn over the image rather than beside it, so the window can stay the size
+// the behaviour system opens it at.
+void Preview::drawDetailOverlay(const PreviewStatus& status)
 {
-    ImGui::PlotHistogram("##histogram", histogram_.data(), kHistogramBins, 0,
-                         nullptr, 0.0f, 1.0f, ImVec2(-1.0f, 60.0f));
-    const double percent = saturatedFraction_ * 100.0;
-    if (percent > 1.0) {
-        ImGui::TextColored(kRed, "%.1f%% saturated", percent);
-    } else {
-        ImGui::TextColored(kDim, "%.2f%% saturated", percent);
+    const ImVec2 parent = ImGui::GetWindowPos();
+    ImGui::SetNextWindowBgAlpha(0.90f);
+    ImGui::SetNextWindowPos(ImVec2(parent.x + 10, parent.y + 40), ImGuiCond_Always);
+    ImGui::SetNextWindowSize(ImVec2(320, 0), ImGuiCond_Always);
+
+    if (ImGui::Begin("##detail", nullptr,
+                     ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
+                     ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_AlwaysAutoResize)) {
+        if (!fpsHistory_.empty()) {
+            std::vector<float> values(fpsHistory_.begin(), fpsHistory_.end());
+            const float lowest = *std::min_element(values.begin(), values.end());
+            const float top = static_cast<float>(status.targetFps) * 1.1f;
+            char caption[48];
+            std::snprintf(caption, sizeof(caption), "fps, 60s, low %.1f", lowest);
+            ImGui::PlotLines("##fps", values.data(), static_cast<int>(values.size()), 0,
+                             caption, 0.0f, top > 0 ? top : 100.0f, ImVec2(-1.0f, 38.0f));
+        }
+
+        if (!bufferHistory_.empty()) {
+            std::vector<float> values(bufferHistory_.begin(), bufferHistory_.end());
+            ImGui::PlotLines("##buffer", values.data(), static_cast<int>(values.size()), 0,
+                             "buffer peak %, 60s", 0.0f, 100.0f, ImVec2(-1.0f, 38.0f));
+        }
+
+        if (status.intervalMedianMs > 0) {
+            ImGui::TextColored(kDim, "interval med %.1f  p99 %.1f  worst %.1f ms",
+                               status.intervalMedianMs, status.intervalP99Ms,
+                               status.intervalWorstMs);
+        }
+        ImGui::TextColored(kDim, "lost %lld in transit, %lld writer behind",
+                           static_cast<long long>(status.droppedInTransit),
+                           static_cast<long long>(status.droppedNoBuffer));
+        if (status.incompleteFrames > 0 || status.cameraResets > 0) {
+            ImGui::TextColored(kAmber, "incomplete %lld   resets %lld",
+                               static_cast<long long>(status.incompleteFrames),
+                               static_cast<long long>(status.cameraResets));
+        }
+        ImGui::TextColored(kDim, "%s  %d x %d %s", status.mouseID.c_str(),
+                           status.imageWidth, status.imageHeight,
+                           status.pixelFormat.c_str());
+        ImGui::PushTextWrapPos(0.0f);
+        ImGui::TextColored(kDim, "%s", status.sinkDescription.c_str());
+        ImGui::PopTextWrapPos();
     }
+    ImGui::End();
 }
 
-void Preview::drawStatsPanel(const PreviewStatus& status)
+void Preview::drawHistogramOverlay()
 {
-    // ---- throughput -------------------------------------------------------
-    ImGui::SeparatorText("Throughput");
+    const ImVec2 parent = ImGui::GetWindowPos();
+    const ImVec2 size = ImGui::GetWindowSize();
+    ImGui::SetNextWindowBgAlpha(0.90f);
+    ImGui::SetNextWindowPos(ImVec2(parent.x + size.x - 262, parent.y + 40), ImGuiCond_Always);
+    ImGui::SetNextWindowSize(ImVec2(250, 0), ImGuiCond_Always);
 
-    const bool behind = status.targetFps > 0 && status.measuredFps < status.targetFps * 0.95;
-    row("frame rate", text("%.1f", status.measuredFps) + " / " +
-                          text("%.1f fps", status.targetFps),
-        behind ? &kAmber : nullptr);
-
-    if (!fpsHistory_.empty()) {
-        std::vector<float> values(fpsHistory_.begin(), fpsHistory_.end());
-        const float top = static_cast<float>(status.targetFps) * 1.1f;
-        const float lowest = *std::min_element(values.begin(), values.end());
-        char caption[48];
-        std::snprintf(caption, sizeof(caption), "last 60 s, low %.1f", lowest);
-        ImGui::PlotLines("##fps", values.data(), static_cast<int>(values.size()), 0,
-                         caption, 0.0f, top > 0 ? top : 100.0f, ImVec2(-1.0f, 46.0f));
+    if (ImGui::Begin("##histogram", nullptr,
+                     ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
+                     ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::PlotHistogram("##hist", histogram_.data(), kHistogramBins, 0,
+                             "exposure", 0.0f, 1.0f, ImVec2(-1.0f, 46.0f));
+        const double percent = saturatedFraction_ * 100.0;
+        if (percent > 1.0) {
+            ImGui::TextColored(kRed, "%.1f%% saturated", percent);
+        } else {
+            ImGui::TextColored(kDim, "%.2f%% saturated", percent);
+        }
     }
-
-    // Spacing between arriving frames. A long tail here is a stall that did not
-    // quite cost a frame - the warning before one that does.
-    if (status.intervalMedianMs > 0) {
-        row("interval med/p99", text("%.1f", status.intervalMedianMs) + " / " +
-                                    text("%.1f ms", status.intervalP99Ms));
-        const bool spike = status.intervalWorstMs > status.intervalMedianMs * 3.0;
-        row("worst interval", text("%.1f ms", status.intervalWorstMs),
-            spike ? &kAmber : nullptr);
-    }
-
-    // ---- buffer -----------------------------------------------------------
-    ImGui::SeparatorText("Buffer");
-
-    const double fraction = status.bufferCapacity > 0
-        ? static_cast<double>(status.bufferDepth) / static_cast<double>(status.bufferCapacity)
-        : 0.0;
-    char overlay[64];
-    std::snprintf(overlay, sizeof(overlay), "%zu / %zu frames",
-                  status.bufferDepth, status.bufferCapacity);
-    ImGui::PushStyleColor(ImGuiCol_PlotHistogram, occupancyColour(fraction));
-    ImGui::ProgressBar(static_cast<float>(fraction), ImVec2(-1.0f, 0.0f), overlay);
-    ImGui::PopStyleColor();
-
-    if (!bufferHistory_.empty()) {
-        std::vector<float> values(bufferHistory_.begin(), bufferHistory_.end());
-        ImGui::PlotLines("##buffer", values.data(), static_cast<int>(values.size()), 0,
-                         "peak occupancy %, last 60 s", 0.0f, 100.0f, ImVec2(-1.0f, 46.0f));
-    }
-
-    const double peakFraction = status.bufferCapacity > 0
-        ? static_cast<double>(status.bufferHighWater) / static_cast<double>(status.bufferCapacity)
-        : 0.0;
-    const ImVec4 peakColour = occupancyColour(peakFraction);
-    row("peak", std::to_string(status.bufferHighWater) + " (" +
-                    text("%.0f%%", peakFraction * 100.0) + ")", &peakColour);
-
-    // ---- frames -----------------------------------------------------------
-    ImGui::SeparatorText("Frames");
-    row("recorded", std::to_string(status.framesWritten));
-    row("lost in transit", std::to_string(status.droppedInTransit),
-        status.droppedInTransit > 0 ? &kRed : nullptr);
-    row("writer behind", std::to_string(status.droppedNoBuffer),
-        status.droppedNoBuffer > 0 ? &kRed : nullptr);
-    if (status.incompleteFrames > 0) {
-        row("incomplete", std::to_string(status.incompleteFrames), &kAmber);
-    }
-    if (status.cameraResets > 0) {
-        row("camera resets", std::to_string(status.cameraResets), &kRed);
-    }
-
-    // ---- camera -----------------------------------------------------------
-    ImGui::SeparatorText("Camera");
-    if (status.exposureMicroseconds >= 0) {
-        // Exposure caps the frame rate: it cannot exceed one frame period.
-        const bool capping = status.targetFps > 0 &&
-                             status.exposureMicroseconds > 1e6 / status.targetFps * 0.95;
-        row("exposure", text("%.0f us", status.exposureMicroseconds),
-            capping ? &kAmber : nullptr);
-    }
-    if (status.temperatureCelsius > -100) {
-        const bool hot = status.temperatureCelsius > 75.0;
-        row("temperature", text("%.1f C", status.temperatureCelsius), hot ? &kRed : nullptr);
-    }
-
-    if (showHistogram_) {
-        drawHistogram();
-    }
-
-    // ---- disk -------------------------------------------------------------
-    ImGui::SeparatorText("Disk");
-    row("write rate", text("%.1f MB/s", status.writeMegabytesPerSecond));
-    row("free", text("%.0f GB", status.diskFreeGigabytes));
-    const bool lowDisk = status.diskSecondsRemaining >= 0 && status.diskSecondsRemaining < 1800;
-    row("time remaining", humanDuration(status.diskSecondsRemaining),
-        lowDisk ? &kRed : nullptr);
-
-    // ---- session ----------------------------------------------------------
-    ImGui::SeparatorText("Session");
-    row("rig", status.rig);
-    row("subject", status.mouseID);
-    row("image", std::to_string(status.imageWidth) + " x " +
-                     std::to_string(status.imageHeight) + " " + status.pixelFormat);
-    // Wrapped rather than clipped: the encoder description is long and used to
-    // run off the edge of the panel.
-    ImGui::TextColored(kDim, "output");
-    ImGui::SameLine(kLabelColumn);
-    ImGui::PushTextWrapPos(0.0f);
-    ImGui::TextUnformatted(status.sinkDescription.c_str());
-    ImGui::PopTextWrapPos();
+    ImGui::End();
 }
 
 void Preview::render(const std::vector<uint8_t>& image, const PreviewStatus& status)
@@ -418,9 +452,7 @@ void Preview::render(const std::vector<uint8_t>& image, const PreviewStatus& sta
     glfwPollEvents();
 
     if (!image.empty()) {
-        if (showImage_) {
-            uploadImage(image);
-        }
+        uploadImage(image);
         if (showHistogram_) {
             computeHistogram(image);
         }
@@ -442,39 +474,35 @@ void Preview::render(const std::vector<uint8_t>& image, const PreviewStatus& sta
                  ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
                  ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoBringToFrontOnFocus);
 
-    ImGui::Checkbox("image", &showImage_);
-    ImGui::SameLine();
-    ImGui::Checkbox("histogram", &showHistogram_);
-    ImGui::SameLine();
-    ImGui::TextColored(kDim, "   Esc to stop");
+    // Thin enough that the picture keeps nearly all of a 640x512 window.
+    const float bannerHeight = ImGui::GetTextLineHeight() + 10.0f;
 
-    // Wide enough that the longest value does not run off the edge, which the
-    // previous 320 px column did for the encoder description and the peak note.
-    const float statsWidth = 400.0f;
-    if (ImGui::BeginTable("##layout", 2, ImGuiTableFlags_Resizable)) {
-        ImGui::TableSetupColumn("image", ImGuiTableColumnFlags_WidthStretch);
-        ImGui::TableSetupColumn("stats", ImGuiTableColumnFlags_WidthFixed, statsWidth);
+    drawTopBanner(status, bannerHeight);
 
-        ImGui::TableNextRow();
-        ImGui::TableSetColumnIndex(0);
-        if (showImage_) {
-            ImGui::BeginChild("##image", ImVec2(0, 0), ImGuiChildFlags_None);
-            drawImagePanel(status);
-            ImGui::EndChild();
-        } else {
-            ImGui::TextColored(kDim, "Image display off. The recording is unaffected.");
-        }
+    const float imageHeight =
+        ImGui::GetContentRegionAvail().y - bannerHeight - ImGui::GetStyle().ItemSpacing.y;
+    ImGui::BeginChild("##image", ImVec2(0, std::max(imageHeight, 1.0f)),
+                      ImGuiChildFlags_None, ImGuiWindowFlags_NoScrollbar);
+    drawImage();
+    ImGui::EndChild();
 
-        ImGui::TableSetColumnIndex(1);
-        ImGui::BeginChild("##stats", ImVec2(0, 0), ImGuiChildFlags_None);
-        drawBanner(status);
-        drawStatsPanel(status);
-        ImGui::EndChild();
+    drawBottomBanner(status, bannerHeight);
 
-        ImGui::EndTable();
+    if (showDetails_) {
+        drawDetailOverlay(status);
+    }
+    if (showHistogram_) {
+        drawHistogramOverlay();
     }
 
     ImGui::End();
+
+    if (ImGui::IsKeyPressed(ImGuiKey_D)) {
+        showDetails_ = !showDetails_;
+    }
+    if (ImGui::IsKeyPressed(ImGuiKey_H)) {
+        showHistogram_ = !showHistogram_;
+    }
 
     // A click on the close button starts a confirmation rather than ending the
     // session. Losing two hours to a stray click is worth one extra dialog.
@@ -493,13 +521,13 @@ void Preview::render(const std::vector<uint8_t>& image, const PreviewStatus& sta
                                ImGuiWindowFlags_AlwaysAutoResize)) {
         ImGui::TextUnformatted("Stop the session and finalise the recording?");
         ImGui::Separator();
-        if (ImGui::Button("Stop", ImVec2(120, 0))) {
+        if (ImGui::Button("Stop", ImVec2(110, 0))) {
             stopRequested_ = true;
             confirmingClose_ = false;
             ImGui::CloseCurrentPopup();
         }
         ImGui::SameLine();
-        if (ImGui::Button("Keep recording", ImVec2(140, 0)) ||
+        if (ImGui::Button("Keep recording", ImVec2(130, 0)) ||
             ImGui::IsKeyPressed(ImGuiKey_Escape)) {
             confirmingClose_ = false;
             ImGui::CloseCurrentPopup();

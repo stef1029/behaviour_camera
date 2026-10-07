@@ -214,20 +214,34 @@ dropped **deliberately and counted** as `dropped_no_buffer`, separately from
 recorded every session, so you can see how close you came even when nothing was
 lost — it is the best early warning there is.
 
-The preview shows all of it live, and is built around one question: is this
-recording healthy? A banner answers it at a glance - green, or red with the number
-of frames lost. Underneath are the numbers behind that: frame rate against target,
-buffer occupancy, both drop counts, write rate, disk time remaining, exposure and
-camera temperature.
+The preview is built around one question: is this recording healthy? It is laid
+out as two thin banners with the picture between them, because the behaviour
+system opens the window at 640x512 and a side panel leaves almost nothing for the
+image at that width.
 
-Two of them are traces over the last minute rather than single values, because a
-number tells you the state now and a trace tells you about the dip thirty seconds
-ago. The buffer trace plots the *peak* between samples, since the buffer fills and
-drains faster than the plot ticks and the spikes are the only thing worth seeing.
-Frame-interval median, p99 and worst are shown too: a long tail there is a stall
-that nearly cost a frame, which is the warning before one that does.
+The top banner answers the question - green `RECORDING`, or red `FRAMES LOST`
+with the count - in a form readable from across the room. The bottom carries the
+numbers: frame rate against target, buffer occupancy and its peak, write rate,
+disk time remaining, exposure, frame-interval p99, camera temperature. If the
+window is too narrow for all of them it drops the least important first, and the
+key hints go before any of the numbers do.
 
-`--histogram` starts with an exposure histogram showing, for setting a camera up.
+Two keys open overlays on top of the image, so no permanent space is spent on
+them:
+
+| Key | |
+|---|---|
+| `d` | traces of frame rate and buffer peak over the last minute, interval statistics, drop counts, output file |
+| `h` | exposure histogram and the saturated-pixel fraction |
+| `esc` | stop, after a confirmation |
+
+The buffer trace plots the *peak* between samples rather than the instantaneous
+value: the buffer fills and drains faster than the plot ticks, so sampling it
+directly draws a flat line straight through a spike. Frame-interval median, p99
+and worst are there because a long tail is a stall that nearly cost a frame,
+which is the warning before one that does.
+
+`--histogram` starts with the histogram already showing, for setting a camera up.
 
 ## Known rough edges
 

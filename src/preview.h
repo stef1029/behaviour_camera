@@ -1,18 +1,21 @@
-// The preview window: live image, plus the numbers that say whether the session
-// is going well.
+// The preview window: live image, with the health of the recording on two thin
+// banners above and below it.
+//
+// The rigs open this at 640x512, which is the size it has to work at. A side
+// panel leaves almost nothing for the image at that width, so the layout is two
+// single-line banners instead and the picture gets everything in between.
+//
+// The top banner answers one question - is this recording healthy - in a form
+// readable from across the room. The bottom carries the numbers behind it, and
+// drops the least important ones rather than overflowing when the window is
+// narrow. The detail that will not fit on a line, the traces and the interval
+// statistics, appears over the image on a keypress.
 //
 // Scaling happens on the GPU. The old version resized every displayed frame on
-// the CPU with cv::resize, on the capture thread, which was both the wrong place
-// to spend time and the only thing OpenCV was used for.
-//
-// The window runs on the main thread rather than inside the capture loop, so it
-// stays responsive when the camera stalls - which is exactly when you want to
-// look at it, and exactly when the old version froze.
-//
-// What it shows is deliberately only about whether the recording is healthy. A
-// trace of frame rate and buffer occupancy over the last minute is worth more
-// than either number on its own, because it shows the dip that happened thirty
-// seconds ago rather than only the state right now.
+// the CPU, on the capture thread, which was both the wrong place to spend time
+// and the only thing OpenCV was used for. The window also runs on the main
+// thread rather than inside the capture loop, so it stays responsive when the
+// camera stalls - which is exactly when you want to look at it.
 
 #pragma once
 
@@ -84,10 +87,11 @@ public:
 private:
     void uploadImage(const std::vector<uint8_t>& image);
     void sampleHistory(const PreviewStatus& status);
-    void drawBanner(const PreviewStatus& status);
-    void drawImagePanel(const PreviewStatus& status);
-    void drawStatsPanel(const PreviewStatus& status);
-    void drawHistogram();
+    void drawTopBanner(const PreviewStatus& status, float height);
+    void drawBottomBanner(const PreviewStatus& status, float height);
+    void drawImage();
+    void drawDetailOverlay(const PreviewStatus& status);
+    void drawHistogramOverlay();
     void computeHistogram(const std::vector<uint8_t>& image);
 
     GLFWwindow* window_ = nullptr;
@@ -96,7 +100,7 @@ private:
     int imageHeight_ = 0;
     bool haveImage_ = false;
 
-    bool showImage_ = true;
+    bool showDetails_ = false;
     bool showHistogram_ = false;
     bool stopRequested_ = false;
     bool confirmingClose_ = false;
@@ -105,7 +109,7 @@ private:
     std::deque<float> fpsHistory_;
     std::deque<float> bufferHistory_;
     double lastSampleSeconds_ = -1.0;
-    // Highest occupancy seen since the last plotted sample. The buffer fills and
+    // Highest occupancy since the last plotted sample. The buffer fills and
     // drains far faster than the plot ticks, so plotting the instantaneous value
     // misses every spike - which is the only thing the trace is there to show.
     float bufferPeakSinceSample_ = 0.0f;
