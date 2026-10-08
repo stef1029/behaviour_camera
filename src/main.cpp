@@ -960,12 +960,13 @@ private:
     }
 
     // Gap kept between one exposure ending and the next starting. The strobe
-    // line is high for the exposure plus ~200 us, and the DAQ counts frames by
-    // seeing it go low in between. 1000 us leaves ~0.8 ms low, 8 samples on the
-    // rigs' 10 kHz DAQs; 500 us left 3, which counted every frame but with
-    // little to spare. (The sensor itself needs only ~300 us.) A slower DAQ
-    // needs a lower ceiling, set with --exposure-max.
-    static constexpr double kExposureFrameMarginUs = 1000.0;
+    // line is high for the exposure plus ~100 us, and the DAQ counts frames by
+    // seeing it go low in between. 2000 us leaves ~1.9 ms low, ~19 samples on
+    // the rigs' 10 kHz DAQs: room for a DAQ cycle that runs long, not just for
+    // sampling. 1000 us (9 samples) counted every frame over an hour; this is
+    // margin on top. (The sensor itself needs only ~300 us.) A slower DAQ needs
+    // a lower ceiling, set with --exposure-max.
+    static constexpr double kExposureFrameMarginUs = 2000.0;
 
     // Sets the auto-exposure range, holding the ceiling under the frame period
     // so the requested rate is the rate recorded. Records what was applied back
@@ -1007,6 +1008,20 @@ private:
         } else {
             ptrLower->SetValue(lower);
             ptrUpper->SetValue(upper);
+        }
+
+        // Auto-exposure only moves toward the new range a step per frame, so a
+        // camera left at a longer exposure by its last session keeps it for the
+        // first few frames - long enough to close the strobe gap the DAQ needs.
+        // Start inside the range instead.
+        CFloatPtr ptrExposure = nodeMap.GetNode("ExposureTime");
+        CEnumEntryPtr ptrOff = ptrAuto->GetEntryByName("Off");
+        if (IsReadable(ptrExposure) && IsReadable(ptrOff) && ptrExposure->GetValue() > upper) {
+            ptrAuto->SetIntValue(ptrOff->GetValue());
+            if (IsWritable(ptrExposure)) {
+                ptrExposure->SetValue(upper);
+            }
+            ptrAuto->SetIntValue(ptrContinuous->GetValue());
         }
 
         settings.exposure_lower_limit_us = ptrLower->GetValue();
