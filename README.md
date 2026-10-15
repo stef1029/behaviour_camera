@@ -140,6 +140,12 @@ Output per session:
 there identifies which frame the camera produced, and those values have gaps whenever
 a frame is lost in transfer. Never use a frame ID as a file offset or a frame index.
 
+**The strobe is silent for 0.5 s just before frame 0.** At startup the recorder
+stops the camera and waits before configuring it, because a camera left exposing by
+an earlier process keeps strobing, and the DAQ would otherwise count those strobes as
+frames. Post-processing counts frames from the first pulse after that gap when there
+are pulses before it.
+
 The recorder checks this invariant before it exits — for raw by dividing the file
 size, for video by counting packets with ffprobe — and records the result as
 `output_frame_count`. A mismatch is reported and gives a non-zero exit code.

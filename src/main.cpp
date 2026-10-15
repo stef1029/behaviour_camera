@@ -179,6 +179,7 @@ public:
         }
 
         pCam->Init();
+        stopLeftoverAcquisition();
 
         // Exposure and the stream buffers go first because the frame rate the
         // camera will accept depends on them, and setCameraFrameRate clamps
@@ -957,6 +958,36 @@ private:
             throw runtime_error("Unable to set " + lineName + " to output");
         }
         ptrLineMode->SetIntValue(ptrOutput->GetValue());
+    }
+
+    // Silence held on the strobe line before recording starts.
+    static constexpr milliseconds kStartGap{ 500 };
+
+    // A camera can still be exposing when the recorder starts — left running by an
+    // earlier process that never stopped it — and it strobes on every exposure
+    // whether or not anything is streaming. The DAQ counts those strobes, but the
+    // frame IDs only begin when this recorder's stream does, so frame 0 would be
+    // matched to the first of them and the whole video timed early. Stopping the
+    // camera and holding it quiet puts a gap on the DAQ just before frame 0, which
+    // hex_behav's post-processing finds and counts from. A camera that was idle
+    // ignores the stop, and the gap then just lengthens the silence before the
+    // first strobe. Done unconditionally: AcquisitionStop is a camera command, so
+    // unlike EndAcquisition it works on an acquisition this process did not start.
+    void stopLeftoverAcquisition()
+    {
+        try {
+            CCommandPtr ptrStop = pCam->GetNodeMap().GetNode("AcquisitionStop");
+            if (IsWritable(ptrStop)) {
+                ptrStop->Execute();
+            } else {
+                cerr << "Warning: AcquisitionStop is not available; a camera left "
+                     << "exposing would not be stopped." << endl;
+            }
+        }
+        catch (Spinnaker::Exception& e) {
+            cerr << "Warning: AcquisitionStop before recording failed: " << e.what() << endl;
+        }
+        std::this_thread::sleep_for(kStartGap);
     }
 
     // Gap kept between one exposure ending and the next starting. The strobe
